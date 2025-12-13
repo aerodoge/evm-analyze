@@ -2019,6 +2019,727 @@ func getRouterAddress(chainID ChainID) common.Address {
 
 ---
 
+## 附录 A: ZK Rollup 深入解析
+
+### A.1 ZK Rollup 架构
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    ZK Rollup 架构                                │
+│                                                                 │
+│  ┌──────────────────────────────────────────────────────────┐  │
+│  │                    L2 执行层                               │  │
+│  │  ┌────────────┐  ┌────────────┐  ┌────────────┐          │  │
+│  │  │ 用户交易   │─▶│ 排序器     │─▶│ 状态更新   │          │  │
+│  │  │            │  │ Sequencer  │  │            │          │  │
+│  │  └────────────┘  └────────────┘  └────────────┘          │  │
+│  └──────────────────────────────────────────────────────────┘  │
+│                              │                                  │
+│                              ▼                                  │
+│  ┌──────────────────────────────────────────────────────────┐  │
+│  │                    证明生成层                              │  │
+│  │  ┌────────────┐  ┌────────────┐  ┌────────────┐          │  │
+│  │  │ 交易批次   │─▶│ ZK Prover  │─▶│ 有效性证明 │          │  │
+│  │  │ Batch      │  │            │  │ Validity   │          │  │
+│  │  └────────────┘  └────────────┘  └────────────┘          │  │
+│  └──────────────────────────────────────────────────────────┘  │
+│                              │                                  │
+│                              ▼                                  │
+│  ┌──────────────────────────────────────────────────────────┐  │
+│  │                    L1 验证层                               │  │
+│  │  ┌────────────┐  ┌────────────┐  ┌────────────┐          │  │
+│  │  │ State Root │  │ Verifier   │  │ 最终性     │          │  │
+│  │  │ 状态根     │  │ 合约验证   │  │ Finality   │          │  │
+│  │  └────────────┘  └────────────┘  └────────────┘          │  │
+│  └──────────────────────────────────────────────────────────┘  │
+│                                                                 │
+│  主要 ZK Rollup:                                                │
+│  - zkSync Era: zkEVM, 原生账户抽象                              │
+│  - StarkNet: Cairo 语言, STARK 证明                            │
+│  - Polygon zkEVM: 完全 EVM 等价                                 │
+│  - Scroll: zkEVM, 字节码级兼容                                  │
+│  - Linea: ConsenSys 开发, Type-2 zkEVM                         │
+│                                                                 │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### A.2 ZK Rollup 客户端实现
+
+```go
+package zkrollup
+
+import (
+    "context"
+    "encoding/json"
+    "fmt"
+    "math/big"
+    "net/http"
+    "time"
+
+    "github.com/ethereum/go-ethereum/common"
+    "github.com/ethereum/go-ethereum/core/types"
+    "github.com/ethereum/go-ethereum/ethclient"
+)
+
+// ZKRollupType ZK Rollup 类型
+type ZKRollupType int
+
+const (
+    ZKSyncEra ZKRollupType = iota
+    StarkNet
+    PolygonZkEVM
+    Scroll
+    Linea
+)
+
+// ZKRollupClient ZK Rollup 通用客户端
+type ZKRollupClient struct {
+    client     *ethclient.Client
+    rollupType ZKRollupType
+    chainID    *big.Int
+
+    // L1 连接
+    l1Client   *ethclient.Client
+    l1Contracts *L1Contracts
+}
+
+// L1Contracts L1 合约地址
+type L1Contracts struct {
+    RollupAddress  common.Address
+    BridgeAddress  common.Address
+    VerifierAddress common.Address
+}
+
+// BatchInfo 批次信息
+type BatchInfo struct {
+    BatchNumber   uint64
+    Timestamp     time.Time
+    StateRoot     common.Hash
+    TxCount       uint64
+    L1TxHash      common.Hash
+    Status        BatchStatus
+}
+
+// BatchStatus 批次状态
+type BatchStatus int
+
+const (
+    BatchPending BatchStatus = iota
+    BatchCommitted
+    BatchProven
+    BatchFinalized
+)
+
+// NewZKRollupClient 创建 ZK Rollup 客户端
+func NewZKRollupClient(rpcURL string, rollupType ZKRollupType, l1Client *ethclient.Client) (*ZKRollupClient, error) {
+    client, err := ethclient.Dial(rpcURL)
+    if err != nil {
+        return nil, err
+    }
+
+    chainID, err := client.ChainID(context.Background())
+    if err != nil {
+        return nil, err
+    }
+
+    return &ZKRollupClient{
+        client:     client,
+        rollupType: rollupType,
+        chainID:    chainID,
+        l1Client:   l1Client,
+        l1Contracts: getL1Contracts(rollupType),
+    }, nil
+}
+
+func getL1Contracts(rollupType ZKRollupType) *L1Contracts {
+    switch rollupType {
+    case ZKSyncEra:
+        return &L1Contracts{
+            RollupAddress:   common.HexToAddress("0x32400084C286CF3E17e7B677ea9583e60a000324"),
+            BridgeAddress:   common.HexToAddress("0x57891966931Eb4Bb6FB81430E6cE0A03AAbDe063"),
+        }
+    case PolygonZkEVM:
+        return &L1Contracts{
+            RollupAddress:   common.HexToAddress("0x5132A183E9F3CB7C848b0AAC5Ae0c4f0491B7aB2"),
+            BridgeAddress:   common.HexToAddress("0x2a3DD3EB832aF982ec71669E178424b10Dca2EDe"),
+        }
+    case Scroll:
+        return &L1Contracts{
+            RollupAddress:   common.HexToAddress("0xa13BAF47339d63B743e7Da8741db5456DAc1E556"),
+            BridgeAddress:   common.HexToAddress("0xD8A791fE2bE73eb6E6cF1eb0cb3F36adC9B3F8f9"),
+        }
+    default:
+        return &L1Contracts{}
+    }
+}
+
+// GetLatestBatchInfo 获取最新批次信息
+func (c *ZKRollupClient) GetLatestBatchInfo(ctx context.Context) (*BatchInfo, error) {
+    switch c.rollupType {
+    case ZKSyncEra:
+        return c.getZKSyncBatchInfo(ctx)
+    case PolygonZkEVM:
+        return c.getPolygonZkEVMBatchInfo(ctx)
+    case Scroll:
+        return c.getScrollBatchInfo(ctx)
+    default:
+        return nil, fmt.Errorf("unsupported rollup type")
+    }
+}
+
+func (c *ZKRollupClient) getZKSyncBatchInfo(ctx context.Context) (*BatchInfo, error) {
+    // zkSync Era 使用 zks_ RPC 方法
+    var result struct {
+        L1BatchNumber    string `json:"l1BatchNumber"`
+        Timestamp        int64  `json:"timestamp"`
+        RootHash         string `json:"rootHash"`
+        CommitTxHash     string `json:"commitTxHash"`
+        ProveTxHash      string `json:"proveTxHash"`
+        ExecuteTxHash    string `json:"executeTxHash"`
+    }
+
+    err := c.client.Client().CallContext(ctx, &result, "zks_L1BatchNumber")
+    if err != nil {
+        return nil, err
+    }
+
+    batchNum, _ := new(big.Int).SetString(result.L1BatchNumber, 0)
+
+    // 获取批次详情
+    var batchDetails struct {
+        Number       uint64      `json:"number"`
+        Timestamp    int64       `json:"timestamp"`
+        RootHash     common.Hash `json:"rootHash"`
+        Status       string      `json:"status"`
+    }
+
+    err = c.client.Client().CallContext(ctx, &batchDetails, "zks_getL1BatchDetails", batchNum.Uint64())
+    if err != nil {
+        return nil, err
+    }
+
+    status := BatchPending
+    switch batchDetails.Status {
+    case "committed":
+        status = BatchCommitted
+    case "proven":
+        status = BatchProven
+    case "executed":
+        status = BatchFinalized
+    }
+
+    return &BatchInfo{
+        BatchNumber: batchDetails.Number,
+        Timestamp:   time.Unix(batchDetails.Timestamp, 0),
+        StateRoot:   batchDetails.RootHash,
+        Status:      status,
+    }, nil
+}
+
+// GetFinalityStatus 获取交易最终性状态
+func (c *ZKRollupClient) GetFinalityStatus(ctx context.Context, txHash common.Hash) (*FinalityStatus, error) {
+    // 获取交易所在批次
+    receipt, err := c.client.TransactionReceipt(ctx, txHash)
+    if err != nil {
+        return nil, err
+    }
+
+    // 获取该批次的状态
+    batchInfo, err := c.getBatchByBlockNumber(ctx, receipt.BlockNumber.Uint64())
+    if err != nil {
+        return nil, err
+    }
+
+    return &FinalityStatus{
+        TxHash:        txHash,
+        BatchNumber:   batchInfo.BatchNumber,
+        L2BlockNumber: receipt.BlockNumber.Uint64(),
+        BatchStatus:   batchInfo.Status,
+        L1TxHash:      batchInfo.L1TxHash,
+        IsFinal:       batchInfo.Status == BatchFinalized,
+    }, nil
+}
+
+// FinalityStatus 最终性状态
+type FinalityStatus struct {
+    TxHash        common.Hash
+    BatchNumber   uint64
+    L2BlockNumber uint64
+    BatchStatus   BatchStatus
+    L1TxHash      common.Hash
+    IsFinal       bool
+}
+
+// WaitForFinality 等待交易最终性
+func (c *ZKRollupClient) WaitForFinality(ctx context.Context, txHash common.Hash, timeout time.Duration) error {
+    ticker := time.NewTicker(30 * time.Second)
+    defer ticker.Stop()
+
+    timeoutCh := time.After(timeout)
+
+    for {
+        select {
+        case <-ctx.Done():
+            return ctx.Err()
+        case <-timeoutCh:
+            return fmt.Errorf("timeout waiting for finality")
+        case <-ticker.C:
+            status, err := c.GetFinalityStatus(ctx, txHash)
+            if err != nil {
+                continue
+            }
+            if status.IsFinal {
+                return nil
+            }
+        }
+    }
+}
+
+// EstimateProofTime 估算证明生成时间
+func (c *ZKRollupClient) EstimateProofTime(ctx context.Context) (time.Duration, error) {
+    // 获取最近几个批次的证明时间
+    latestBatch, err := c.GetLatestBatchInfo(ctx)
+    if err != nil {
+        return 0, err
+    }
+
+    // 计算平均证明时间
+    var totalTime time.Duration
+    count := 0
+
+    for i := uint64(0); i < 10 && latestBatch.BatchNumber > i; i++ {
+        batchNum := latestBatch.BatchNumber - i
+        batch, err := c.getBatchByNumber(ctx, batchNum)
+        if err != nil || batch.Status != BatchFinalized {
+            continue
+        }
+
+        // 证明时间 = 最终化时间 - 提交时间
+        // 这里简化处理
+        totalTime += 30 * time.Minute
+        count++
+    }
+
+    if count == 0 {
+        return 30 * time.Minute, nil // 默认估计
+    }
+
+    return totalTime / time.Duration(count), nil
+}
+```
+
+### A.3 zkSync Era 特定功能
+
+```go
+// ZKSyncEraClient zkSync Era 专用客户端
+type ZKSyncEraClient struct {
+    *ZKRollupClient
+}
+
+// NewZKSyncEraClient 创建 zkSync Era 客户端
+func NewZKSyncEraClient(rpcURL string, l1Client *ethclient.Client) (*ZKSyncEraClient, error) {
+    base, err := NewZKRollupClient(rpcURL, ZKSyncEra, l1Client)
+    if err != nil {
+        return nil, err
+    }
+    return &ZKSyncEraClient{base}, nil
+}
+
+// GetMainContractAddress 获取主合约地址
+func (c *ZKSyncEraClient) GetMainContractAddress(ctx context.Context) (common.Address, error) {
+    var result common.Address
+    err := c.client.Client().CallContext(ctx, &result, "zks_getMainContract")
+    return result, err
+}
+
+// GetBridgeContracts 获取桥合约地址
+func (c *ZKSyncEraClient) GetBridgeContracts(ctx context.Context) (*BridgeContracts, error) {
+    var result BridgeContracts
+    err := c.client.Client().CallContext(ctx, &result, "zks_getBridgeContracts")
+    return &result, err
+}
+
+// BridgeContracts 桥合约
+type BridgeContracts struct {
+    L1Erc20DefaultBridge common.Address `json:"l1Erc20DefaultBridge"`
+    L2Erc20DefaultBridge common.Address `json:"l2Erc20DefaultBridge"`
+    L1WethBridge         common.Address `json:"l1WethBridge"`
+    L2WethBridge         common.Address `json:"l2WethBridge"`
+}
+
+// GetL1GasPrice 获取 L1 gas 价格
+func (c *ZKSyncEraClient) GetL1GasPrice(ctx context.Context) (*big.Int, error) {
+    var result string
+    err := c.client.Client().CallContext(ctx, &result, "zks_getL1GasPrice")
+    if err != nil {
+        return nil, err
+    }
+    gasPrice, _ := new(big.Int).SetString(result, 0)
+    return gasPrice, nil
+}
+
+// EstimateFee 估算交易费用
+func (c *ZKSyncEraClient) EstimateFee(ctx context.Context, tx *types.Transaction) (*ZKSyncFee, error) {
+    msg := map[string]interface{}{
+        "from":  tx.From(),
+        "to":    tx.To(),
+        "data":  tx.Data(),
+        "value": tx.Value(),
+    }
+
+    var result ZKSyncFee
+    err := c.client.Client().CallContext(ctx, &result, "zks_estimateFee", msg)
+    return &result, err
+}
+
+// ZKSyncFee 费用估算
+type ZKSyncFee struct {
+    GasLimit          *big.Int `json:"gas_limit"`
+    GasPerPubdataLimit *big.Int `json:"gas_per_pubdata_limit"`
+    MaxFeePerGas      *big.Int `json:"max_fee_per_gas"`
+    MaxPriorityFeePerGas *big.Int `json:"max_priority_fee_per_gas"`
+}
+
+// GetAccountAbstractionNonce 获取 AA nonce
+func (c *ZKSyncEraClient) GetAccountAbstractionNonce(ctx context.Context, address common.Address) (uint64, error) {
+    var result string
+    err := c.client.Client().CallContext(ctx, &result, "eth_getTransactionCount", address, "pending")
+    if err != nil {
+        return 0, err
+    }
+    nonce, _ := new(big.Int).SetString(result, 0)
+    return nonce.Uint64(), nil
+}
+
+// SendRawTransaction 发送原始交易 (支持 EIP-712 签名)
+func (c *ZKSyncEraClient) SendRawTransactionWithPaymaster(
+    ctx context.Context,
+    tx *types.Transaction,
+    paymaster common.Address,
+    paymasterInput []byte,
+) (common.Hash, error) {
+    // zkSync Era 支持 Paymaster
+    // 构建 EIP-712 交易
+
+    return common.Hash{}, nil
+}
+```
+
+### A.4 Polygon zkEVM 客户端
+
+```go
+// PolygonZkEVMClient Polygon zkEVM 专用客户端
+type PolygonZkEVMClient struct {
+    *ZKRollupClient
+}
+
+// NewPolygonZkEVMClient 创建 Polygon zkEVM 客户端
+func NewPolygonZkEVMClient(rpcURL string, l1Client *ethclient.Client) (*PolygonZkEVMClient, error) {
+    base, err := NewZKRollupClient(rpcURL, PolygonZkEVM, l1Client)
+    if err != nil {
+        return nil, err
+    }
+    return &PolygonZkEVMClient{base}, nil
+}
+
+// GetBatchByNumber 获取批次信息
+func (c *PolygonZkEVMClient) GetBatchByNumber(ctx context.Context, batchNum uint64) (*PolygonBatch, error) {
+    var result PolygonBatch
+    err := c.client.Client().CallContext(ctx, &result, "zkevm_getBatchByNumber", batchNum)
+    return &result, err
+}
+
+// PolygonBatch Polygon zkEVM 批次
+type PolygonBatch struct {
+    Number          uint64        `json:"number"`
+    Coinbase        common.Address `json:"coinbase"`
+    StateRoot       common.Hash   `json:"stateRoot"`
+    GlobalExitRoot  common.Hash   `json:"globalExitRoot"`
+    LocalExitRoot   common.Hash   `json:"localExitRoot"`
+    AccInputHash    common.Hash   `json:"accInputHash"`
+    Timestamp       uint64        `json:"timestamp"`
+    SendSequencesTxHash common.Hash `json:"sendSequencesTxHash"`
+    VerifyBatchTxHash   common.Hash `json:"verifyBatchTxHash"`
+    Closed          bool          `json:"closed"`
+}
+
+// IsVirtualized 检查批次是否已虚拟化
+func (c *PolygonZkEVMClient) IsVirtualized(ctx context.Context, batchNum uint64) (bool, error) {
+    var result bool
+    err := c.client.Client().CallContext(ctx, &result, "zkevm_isBlockVirtualized", batchNum)
+    return result, err
+}
+
+// IsConsolidated 检查批次是否已整合 (证明已验证)
+func (c *PolygonZkEVMClient) IsConsolidated(ctx context.Context, batchNum uint64) (bool, error) {
+    var result bool
+    err := c.client.Client().CallContext(ctx, &result, "zkevm_isBlockConsolidated", batchNum)
+    return result, err
+}
+
+// GetVerifiedBatchNumber 获取已验证的批次号
+func (c *PolygonZkEVMClient) GetVerifiedBatchNumber(ctx context.Context) (uint64, error) {
+    var result string
+    err := c.client.Client().CallContext(ctx, &result, "zkevm_verifiedBatchNumber")
+    if err != nil {
+        return 0, err
+    }
+    num, _ := new(big.Int).SetString(result, 0)
+    return num.Uint64(), nil
+}
+
+// GetExitRootByGlobalExitRoot 获取退出根
+func (c *PolygonZkEVMClient) GetExitRootByGlobalExitRoot(ctx context.Context, globalExitRoot common.Hash) (*ExitRoot, error) {
+    var result ExitRoot
+    err := c.client.Client().CallContext(ctx, &result, "zkevm_getExitRootByGlobalExitRoot", globalExitRoot)
+    return &result, err
+}
+
+// ExitRoot 退出根
+type ExitRoot struct {
+    MainnetExitRoot common.Hash `json:"mainnetExitRoot"`
+    RollupExitRoot  common.Hash `json:"rollupExitRoot"`
+    GlobalExitRoot  common.Hash `json:"globalExitRoot"`
+}
+```
+
+### A.5 ZK Rollup 套利策略
+
+```go
+// ZKRollupArbitrage ZK Rollup 套利
+type ZKRollupArbitrage struct {
+    clients map[ZKRollupType]*ZKRollupClient
+    l1Client *ethclient.Client
+}
+
+// ZKArbitrageOpportunity 套利机会
+type ZKArbitrageOpportunity struct {
+    SourceChain    ZKRollupType
+    TargetChain    ZKRollupType
+    Token          common.Address
+    SourcePrice    *big.Float
+    TargetPrice    *big.Float
+    PriceDiffBps   int
+    EstimatedProfit *big.Int
+    ProofTime      time.Duration  // 证明时间影响套利时效
+    GasCost        *big.Int
+    Risk           ArbitrageRisk
+}
+
+// ArbitrageRisk 风险等级
+type ArbitrageRisk int
+
+const (
+    RiskLow ArbitrageRisk = iota
+    RiskMedium
+    RiskHigh
+)
+
+// NewZKRollupArbitrage 创建 ZK 套利器
+func NewZKRollupArbitrage(l1Client *ethclient.Client, configs map[ZKRollupType]string) (*ZKRollupArbitrage, error) {
+    clients := make(map[ZKRollupType]*ZKRollupClient)
+
+    for rollupType, rpcURL := range configs {
+        client, err := NewZKRollupClient(rpcURL, rollupType, l1Client)
+        if err != nil {
+            return nil, err
+        }
+        clients[rollupType] = client
+    }
+
+    return &ZKRollupArbitrage{
+        clients:  clients,
+        l1Client: l1Client,
+    }, nil
+}
+
+// FindOpportunities 查找套利机会
+func (a *ZKRollupArbitrage) FindOpportunities(ctx context.Context, token common.Address) ([]ZKArbitrageOpportunity, error) {
+    var opportunities []ZKArbitrageOpportunity
+
+    // 获取各链上的价格
+    prices := make(map[ZKRollupType]*big.Float)
+
+    for rollupType, client := range a.clients {
+        price, err := a.getTokenPrice(ctx, client, token)
+        if err != nil {
+            continue
+        }
+        prices[rollupType] = price
+    }
+
+    // 比较价格差异
+    for source, sourcePrice := range prices {
+        for target, targetPrice := range prices {
+            if source == target {
+                continue
+            }
+
+            diff := new(big.Float).Sub(targetPrice, sourcePrice)
+            ratio := new(big.Float).Quo(diff, sourcePrice)
+            ratioF, _ := ratio.Float64()
+            diffBps := int(ratioF * 10000)
+
+            if diffBps > 50 { // 至少 0.5% 价差
+                // 获取证明时间
+                proofTime, _ := a.clients[source].EstimateProofTime(ctx)
+
+                // 评估风险
+                risk := a.evaluateRisk(diffBps, proofTime)
+
+                opportunities = append(opportunities, ZKArbitrageOpportunity{
+                    SourceChain:  source,
+                    TargetChain:  target,
+                    Token:        token,
+                    SourcePrice:  sourcePrice,
+                    TargetPrice:  targetPrice,
+                    PriceDiffBps: diffBps,
+                    ProofTime:    proofTime,
+                    Risk:         risk,
+                })
+            }
+        }
+    }
+
+    return opportunities, nil
+}
+
+// evaluateRisk 评估风险
+func (a *ZKRollupArbitrage) evaluateRisk(diffBps int, proofTime time.Duration) ArbitrageRisk {
+    // 证明时间越长，价格波动风险越高
+    if proofTime > 2*time.Hour {
+        return RiskHigh
+    }
+
+    // 价差越小，被抢先风险越高
+    if diffBps < 100 {
+        return RiskHigh
+    }
+
+    if proofTime > 1*time.Hour || diffBps < 200 {
+        return RiskMedium
+    }
+
+    return RiskLow
+}
+
+// ExecuteArbitrage 执行套利
+func (a *ZKRollupArbitrage) ExecuteArbitrage(
+    ctx context.Context,
+    opp ZKArbitrageOpportunity,
+    amount *big.Int,
+    auth *bind.TransactOpts,
+) (*ArbitrageResult, error) {
+    result := &ArbitrageResult{
+        Opportunity: opp,
+        StartTime:   time.Now(),
+    }
+
+    // 1. 在源链买入
+    sourceTx, err := a.buyOnSource(ctx, opp.SourceChain, opp.Token, amount, auth)
+    if err != nil {
+        result.Error = err
+        return result, err
+    }
+    result.SourceTxHash = sourceTx.Hash()
+
+    // 2. 等待证明生成 (或使用快速桥)
+    if opp.ProofTime > 30*time.Minute {
+        // 使用快速桥 (如 Orbiter, LayerZero)
+        bridgeTx, err := a.bridgeWithFastPath(ctx, opp, amount, auth)
+        if err != nil {
+            result.Error = err
+            return result, err
+        }
+        result.BridgeTxHash = bridgeTx.Hash()
+    } else {
+        // 等待原生桥
+        err = a.clients[opp.SourceChain].WaitForFinality(ctx, sourceTx.Hash(), opp.ProofTime*2)
+        if err != nil {
+            result.Error = err
+            return result, err
+        }
+
+        bridgeTx, err := a.bridgeWithNative(ctx, opp, amount, auth)
+        if err != nil {
+            result.Error = err
+            return result, err
+        }
+        result.BridgeTxHash = bridgeTx.Hash()
+    }
+
+    // 3. 在目标链卖出
+    targetTx, err := a.sellOnTarget(ctx, opp.TargetChain, opp.Token, amount, auth)
+    if err != nil {
+        result.Error = err
+        return result, err
+    }
+    result.TargetTxHash = targetTx.Hash()
+
+    // 4. 计算实际利润
+    result.EndTime = time.Now()
+    result.ActualProfit = a.calculateActualProfit(result)
+
+    return result, nil
+}
+
+// ArbitrageResult 套利结果
+type ArbitrageResult struct {
+    Opportunity   ZKArbitrageOpportunity
+    SourceTxHash  common.Hash
+    BridgeTxHash  common.Hash
+    TargetTxHash  common.Hash
+    StartTime     time.Time
+    EndTime       time.Time
+    ActualProfit  *big.Int
+    GasSpent      *big.Int
+    Error         error
+}
+
+// CompareProofSystems 比较证明系统
+func CompareProofSystems() {
+    /*
+    ZK 证明系统比较:
+
+    | 系统     | 证明时间  | 证明大小 | 验证成本 | 代表项目      |
+    |----------|----------|---------|---------|--------------|
+    | SNARK    | 分钟级   | ~200B   | 低      | zkSync      |
+    | STARK    | 秒级     | ~100KB  | 中      | StarkNet    |
+    | PLONK    | 分钟级   | ~500B   | 低      | Polygon     |
+    | Halo2    | 分钟级   | ~200B   | 低      | Scroll      |
+
+    选择考量:
+    - SNARK: 需要可信设置，但证明小
+    - STARK: 无需可信设置，量子安全，但证明大
+    - PLONK: 通用可信设置，可更新
+    - Halo2: 无需可信设置，证明小
+    */
+}
+```
+
+### A.6 ZK Rollup 对比
+
+```
+┌────────────────────────────────────────────────────────────────────────┐
+│                    ZK Rollup 主要项目对比                                │
+├──────────┬───────────┬───────────┬───────────┬──────────┬─────────────┤
+│ 特性     │ zkSync Era │ StarkNet  │ Polygon   │ Scroll   │ Linea       │
+│          │            │           │ zkEVM     │          │             │
+├──────────┼───────────┼───────────┼───────────┼──────────┼─────────────┤
+│ 证明系统 │ SNARK     │ STARK     │ PLONK     │ Halo2    │ SNARK       │
+│ EVM 兼容 │ 字节码    │ Cairo VM  │ 完全等价  │ 字节码   │ 字节码      │
+│ 账户抽象 │ 原生支持  │ 原生支持  │ ERC-4337  │ ERC-4337 │ ERC-4337    │
+│ 证明时间 │ ~10分钟   │ ~分钟级   │ ~30分钟   │ ~20分钟  │ ~15分钟     │
+│ TPS      │ ~2000     │ ~500      │ ~2000     │ ~1000    │ ~1500       │
+│ 最终性   │ ~小时级   │ ~小时级   │ ~小时级   │ ~小时级  │ ~小时级     │
+├──────────┼───────────┼───────────┼───────────┼──────────┼─────────────┤
+│ 套利优势 │ AA 支持   │ 低费用    │ 兼容性好  │ 安全性高 │ 生态完善    │
+│ 套利劣势 │ 验证慢    │ 语言学习  │ 证明慢    │ 较新     │ 中心化      │
+└──────────┴───────────┴───────────┴───────────┴──────────┴─────────────┘
+```
+
+---
+
 ## 本文总结
 
 本文深入探讨了 Layer2 跨链套利，主要涵盖：

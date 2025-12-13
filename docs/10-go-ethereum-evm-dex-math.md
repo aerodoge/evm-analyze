@@ -5059,3 +5059,818 @@ func (o *CurveArbitrageOptimizer) calculateProfit(amount *big.Int, diff float64)
     return profitInt
 }
 ```
+
+## 附录 B: Balancer 与 Maverick 数学模型
+
+### B.1 Balancer 加权池数学
+
+Balancer 使用加权恒定乘积公式，允许任意权重的多代币池。
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    Balancer 加权池恒定值公式                      │
+│                                                                 │
+│  不变量: V = ∏(Bi^Wi) = 常数                                    │
+│                                                                 │
+│  其中:                                                          │
+│  - Bi = 代币 i 的余额                                           │
+│  - Wi = 代币 i 的权重 (所有权重之和为 1)                         │
+│                                                                 │
+│  示例: 80/20 ETH/USDC 池                                        │
+│  V = ETH^0.8 × USDC^0.2                                        │
+│                                                                 │
+│  交换公式:                                                       │
+│  Ao = Bo × (1 - (Bi / (Bi + Ai))^(Wi/Wo))                      │
+│                                                                 │
+│  其中:                                                          │
+│  - Ai = 输入代币数量                                            │
+│  - Ao = 输出代币数量                                            │
+│  - Bi = 输入代币余额                                            │
+│  - Bo = 输出代币余额                                            │
+│  - Wi = 输入代币权重                                            │
+│  - Wo = 输出代币权重                                            │
+│                                                                 │
+│  边际价格 (Spot Price):                                         │
+│  SP = (Bi / Wi) / (Bo / Wo)                                    │
+│                                                                 │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+```go
+package balancer
+
+import (
+    "math"
+    "math/big"
+
+    "github.com/ethereum/go-ethereum/common"
+)
+
+// BalancerWeightedPool Balancer 加权池
+type BalancerWeightedPool struct {
+    Address    common.Address
+    Tokens     []common.Address
+    Balances   []*big.Int
+    Weights    []float64  // 权重, 总和为 1
+    SwapFee    *big.Int   // 18 位小数, 如 0.003e18 = 0.3%
+    Decimals   []uint8
+}
+
+// BalancerMath Balancer 数学库
+type BalancerMath struct{}
+
+// CalcOutGivenIn 计算给定输入时的输出量
+// Ao = Bo × (1 - (Bi / (Bi + Ai × (1 - fee)))^(Wi/Wo))
+func (m *BalancerMath) CalcOutGivenIn(
+    balanceIn *big.Int,
+    weightIn float64,
+    balanceOut *big.Int,
+    weightOut float64,
+    amountIn *big.Int,
+    swapFee *big.Int,
+) *big.Int {
+    // 扣除手续费
+    feeComplement := new(big.Int).Sub(big.NewInt(1e18), swapFee)
+    adjustedIn := new(big.Int).Mul(amountIn, feeComplement)
+    adjustedIn.Div(adjustedIn, big.NewInt(1e18))
+
+    // 计算 Bi / (Bi + Ai)
+    newBalanceIn := new(big.Int).Add(balanceIn, adjustedIn)
+
+    // 使用浮点数进行幂运算
+    balanceInF := new(big.Float).SetInt(balanceIn)
+    newBalanceInF := new(big.Float).SetInt(newBalanceIn)
+    balanceOutF := new(big.Float).SetInt(balanceOut)
+
+    // ratio = Bi / (Bi + Ai)
+    ratio, _ := new(big.Float).Quo(balanceInF, newBalanceInF).Float64()
+
+    // exponent = Wi / Wo
+    exponent := weightIn / weightOut
+
+    // (ratio)^exponent
+    power := math.Pow(ratio, exponent)
+
+    // Ao = Bo × (1 - power)
+    amountOutF := new(big.Float).Mul(balanceOutF, big.NewFloat(1-power))
+    amountOut, _ := amountOutF.Int(nil)
+
+    return amountOut
+}
+
+// CalcInGivenOut 计算给定输出时的输入量
+// Ai = Bi × ((Bo / (Bo - Ao))^(Wo/Wi) - 1) / (1 - fee)
+func (m *BalancerMath) CalcInGivenOut(
+    balanceIn *big.Int,
+    weightIn float64,
+    balanceOut *big.Int,
+    weightOut float64,
+    amountOut *big.Int,
+    swapFee *big.Int,
+) *big.Int {
+    // 计算 Bo / (Bo - Ao)
+    newBalanceOut := new(big.Int).Sub(balanceOut, amountOut)
+
+    balanceInF := new(big.Float).SetInt(balanceIn)
+    balanceOutF := new(big.Float).SetInt(balanceOut)
+    newBalanceOutF := new(big.Float).SetInt(newBalanceOut)
+
+    // ratio = Bo / (Bo - Ao)
+    ratio, _ := new(big.Float).Quo(balanceOutF, newBalanceOutF).Float64()
+
+    // exponent = Wo / Wi
+    exponent := weightOut / weightIn
+
+    // (ratio)^exponent - 1
+    power := math.Pow(ratio, exponent) - 1
+
+    // Ai = Bi × power
+    amountInF := new(big.Float).Mul(balanceInF, big.NewFloat(power))
+    amountIn, _ := amountInF.Int(nil)
+
+    // 加上手续费
+    feeComplement := new(big.Int).Sub(big.NewInt(1e18), swapFee)
+    amountIn.Mul(amountIn, big.NewInt(1e18))
+    amountIn.Div(amountIn, feeComplement)
+
+    return amountIn
+}
+
+// CalcSpotPrice 计算即期价格
+// SP = (Bi / Wi) / (Bo / Wo) × (1 / (1 - fee))
+func (m *BalancerMath) CalcSpotPrice(
+    balanceIn *big.Int,
+    weightIn float64,
+    balanceOut *big.Int,
+    weightOut float64,
+    swapFee *big.Int,
+) *big.Float {
+    balanceInF := new(big.Float).SetInt(balanceIn)
+    balanceOutF := new(big.Float).SetInt(balanceOut)
+
+    // (Bi / Wi)
+    numerator := new(big.Float).Quo(balanceInF, big.NewFloat(weightIn))
+
+    // (Bo / Wo)
+    denominator := new(big.Float).Quo(balanceOutF, big.NewFloat(weightOut))
+
+    // 基础价格
+    price := new(big.Float).Quo(numerator, denominator)
+
+    // 加上手续费调整
+    swapFeeF := new(big.Float).SetInt(swapFee)
+    feeComplement := new(big.Float).Sub(big.NewFloat(1e18), swapFeeF)
+    feeMultiplier := new(big.Float).Quo(big.NewFloat(1e18), feeComplement)
+    price.Mul(price, feeMultiplier)
+
+    return price
+}
+```
+
+### B.2 Balancer V2 Composable Stable Pool
+
+```go
+// ComposableStablePool Balancer V2 Composable Stable Pool
+// 结合了 Curve StableSwap 和 Balancer 的设计
+type ComposableStablePool struct {
+    Address       common.Address
+    Tokens        []common.Address
+    Balances      []*big.Int
+    BptIndex      int        // BPT 代币在数组中的索引
+    Amp           *big.Int   // 放大系数
+    SwapFee       *big.Int
+    ScalingFactors []*big.Int // 各代币的缩放因子
+}
+
+// ComposableStableMath Composable Stable 数学库
+type ComposableStableMath struct{}
+
+// CalcOutGivenIn 计算输出 (排除 BPT)
+func (m *ComposableStableMath) CalcOutGivenIn(
+    pool *ComposableStablePool,
+    tokenInIndex int,
+    tokenOutIndex int,
+    amountIn *big.Int,
+) *big.Int {
+    // 1. 获取除 BPT 外的余额
+    balances := m.dropBptItem(pool.Balances, pool.BptIndex)
+
+    // 调整索引
+    adjustedInIndex := m.adjustIndex(tokenInIndex, pool.BptIndex)
+    adjustedOutIndex := m.adjustIndex(tokenOutIndex, pool.BptIndex)
+
+    // 2. 应用缩放因子
+    scaledBalances := m.upscaleBalances(balances, pool.ScalingFactors)
+    scaledAmountIn := m.upscale(amountIn, pool.ScalingFactors[tokenInIndex])
+
+    // 3. 扣除手续费
+    feeComplement := new(big.Int).Sub(big.NewInt(1e18), pool.SwapFee)
+    scaledAmountIn.Mul(scaledAmountIn, feeComplement)
+    scaledAmountIn.Div(scaledAmountIn, big.NewInt(1e18))
+
+    // 4. 计算不变量
+    invariant := m.calculateInvariant(pool.Amp, scaledBalances)
+
+    // 5. 计算输出
+    scaledAmountOut := m.calcOutGivenInStable(
+        scaledBalances,
+        adjustedInIndex,
+        adjustedOutIndex,
+        scaledAmountIn,
+        invariant,
+        pool.Amp,
+    )
+
+    // 6. 反向缩放
+    return m.downscale(scaledAmountOut, pool.ScalingFactors[tokenOutIndex])
+}
+
+// calculateInvariant 计算 StableSwap 不变量
+func (m *ComposableStableMath) calculateInvariant(amp *big.Int, balances []*big.Int) *big.Int {
+    n := len(balances)
+    sum := big.NewInt(0)
+    for _, b := range balances {
+        sum.Add(sum, b)
+    }
+
+    if sum.Sign() == 0 {
+        return big.NewInt(0)
+    }
+
+    // 牛顿迭代求解 D
+    ampTimesNpowN := new(big.Int).Mul(amp, big.NewInt(int64(n)))
+    for i := 1; i < n; i++ {
+        ampTimesNpowN.Mul(ampTimesNpowN, big.NewInt(int64(n)))
+    }
+
+    D := new(big.Int).Set(sum)
+    prevD := big.NewInt(0)
+
+    for i := 0; i < 255; i++ {
+        dP := new(big.Int).Set(D)
+        for _, b := range balances {
+            dP.Mul(dP, D)
+            dP.Div(dP, new(big.Int).Mul(b, big.NewInt(int64(n))))
+        }
+
+        prevD.Set(D)
+
+        numerator := new(big.Int).Mul(ampTimesNpowN, sum)
+        numerator.Add(numerator, new(big.Int).Mul(big.NewInt(int64(n)), dP))
+        numerator.Mul(numerator, D)
+
+        denominator := new(big.Int).Sub(ampTimesNpowN, big.NewInt(1))
+        denominator.Mul(denominator, D)
+        denominator.Add(denominator, new(big.Int).Mul(big.NewInt(int64(n+1)), dP))
+
+        D.Div(numerator, denominator)
+
+        diff := new(big.Int).Sub(D, prevD)
+        diff.Abs(diff)
+        if diff.Cmp(big.NewInt(1)) <= 0 {
+            return D
+        }
+    }
+
+    return D
+}
+
+func (m *ComposableStableMath) dropBptItem(items []*big.Int, bptIndex int) []*big.Int {
+    result := make([]*big.Int, 0, len(items)-1)
+    for i, item := range items {
+        if i != bptIndex {
+            result = append(result, item)
+        }
+    }
+    return result
+}
+
+func (m *ComposableStableMath) adjustIndex(index, bptIndex int) int {
+    if index > bptIndex {
+        return index - 1
+    }
+    return index
+}
+
+func (m *ComposableStableMath) upscale(amount *big.Int, scalingFactor *big.Int) *big.Int {
+    return new(big.Int).Mul(amount, scalingFactor)
+}
+
+func (m *ComposableStableMath) downscale(amount *big.Int, scalingFactor *big.Int) *big.Int {
+    return new(big.Int).Div(amount, scalingFactor)
+}
+
+func (m *ComposableStableMath) upscaleBalances(balances []*big.Int, factors []*big.Int) []*big.Int {
+    result := make([]*big.Int, len(balances))
+    for i, b := range balances {
+        result[i] = m.upscale(b, factors[i])
+    }
+    return result
+}
+```
+
+### B.3 Maverick AMM 数学
+
+Maverick 使用创新的"流动性仓位"(Liquidity Bin) 模型，允许流动性提供者选择单向或双向流动性，并可以根据价格变动自动调整位置。
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    Maverick 流动性仓位模型                        │
+│                                                                 │
+│  Maverick 将价格空间划分为离散的 "bins"                          │
+│  每个 bin 有固定的价格范围 [tickLower, tickUpper]                 │
+│                                                                 │
+│  价格与 tick 的关系:                                             │
+│  price = 1.0001^tick                                            │
+│                                                                 │
+│  流动性类型:                                                     │
+│  - Mode 0: Static (固定位置)                                     │
+│  - Mode 1: Right (价格上涨时跟随)                                │
+│  - Mode 2: Left (价格下跌时跟随)                                 │
+│  - Mode 3: Both (双向跟随)                                       │
+│                                                                 │
+│  单个 Bin 内的交换:                                              │
+│  使用恒定和公式: L = x + y/p                                     │
+│  输出量: dy = dx × p × (1 - fee)                                │
+│                                                                 │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+```go
+package maverick
+
+import (
+    "math"
+    "math/big"
+
+    "github.com/ethereum/go-ethereum/common"
+)
+
+// LiquidityMode 流动性模式
+type LiquidityMode uint8
+
+const (
+    ModeStatic LiquidityMode = 0 // 固定位置
+    ModeRight  LiquidityMode = 1 // 价格上涨跟随
+    ModeLeft   LiquidityMode = 2 // 价格下跌跟随
+    ModeBoth   LiquidityMode = 3 // 双向跟随
+)
+
+// MaverickPool Maverick 池
+type MaverickPool struct {
+    Address      common.Address
+    TokenA       common.Address
+    TokenB       common.Address
+    Fee          *big.Int     // 18 位小数
+    TickSpacing  int64        // tick 间距
+    ActiveTick   int64        // 当前活跃 tick
+    Bins         map[int64]*Bin
+}
+
+// Bin 流动性仓位
+type Bin struct {
+    ID           int64
+    LowerTick    int64
+    UpperTick    int64
+    ReserveA     *big.Int
+    ReserveB     *big.Int
+}
+
+// MaverickMath Maverick 数学库
+type MaverickMath struct {
+    tickBase float64 // 1.0001
+}
+
+// NewMaverickMath 创建数学库
+func NewMaverickMath() *MaverickMath {
+    return &MaverickMath{tickBase: 1.0001}
+}
+
+// TickToPrice 将 tick 转换为价格
+func (m *MaverickMath) TickToPrice(tick int64) *big.Float {
+    price := math.Pow(m.tickBase, float64(tick))
+    return big.NewFloat(price)
+}
+
+// PriceToTick 将价格转换为 tick
+func (m *MaverickMath) PriceToTick(price float64) int64 {
+    tick := math.Log(price) / math.Log(m.tickBase)
+    return int64(math.Floor(tick))
+}
+
+// CalcSwapInBin 计算单个 bin 内的交换
+func (m *MaverickMath) CalcSwapInBin(
+    bin *Bin,
+    amountIn *big.Int,
+    tokenAIn bool,
+    fee *big.Int,
+) (amountOut *big.Int, remainingIn *big.Int) {
+    // 获取 bin 的价格
+    price := m.TickToPrice((bin.LowerTick + bin.UpperTick) / 2)
+    priceF, _ := price.Float64()
+
+    // 扣除手续费
+    feeComplement := new(big.Int).Sub(big.NewInt(1e18), fee)
+    effectiveIn := new(big.Int).Mul(amountIn, feeComplement)
+    effectiveIn.Div(effectiveIn, big.NewInt(1e18))
+
+    effectiveInF := new(big.Float).SetInt(effectiveIn)
+
+    if tokenAIn {
+        // A -> B
+        maxAIn := new(big.Float).SetInt(bin.ReserveB)
+        maxAIn.Quo(maxAIn, big.NewFloat(priceF))
+
+        maxAInInt, _ := maxAIn.Int(nil)
+
+        if effectiveIn.Cmp(maxAInInt) <= 0 {
+            amountOutF := new(big.Float).Mul(effectiveInF, big.NewFloat(priceF))
+            amountOut, _ = amountOutF.Int(nil)
+            return amountOut, big.NewInt(0)
+        } else {
+            amountOut = new(big.Int).Set(bin.ReserveB)
+            remainingIn = new(big.Int).Sub(effectiveIn, maxAInInt)
+            remainingIn.Mul(remainingIn, big.NewInt(1e18))
+            remainingIn.Div(remainingIn, feeComplement)
+            return amountOut, remainingIn
+        }
+    } else {
+        // B -> A
+        maxBIn := new(big.Float).SetInt(bin.ReserveA)
+        maxBIn.Mul(maxBIn, big.NewFloat(priceF))
+
+        maxBInInt, _ := maxBIn.Int(nil)
+
+        if effectiveIn.Cmp(maxBInInt) <= 0 {
+            amountOutF := new(big.Float).Quo(effectiveInF, big.NewFloat(priceF))
+            amountOut, _ = amountOutF.Int(nil)
+            return amountOut, big.NewInt(0)
+        } else {
+            amountOut = new(big.Int).Set(bin.ReserveA)
+            remainingIn = new(big.Int).Sub(effectiveIn, maxBInInt)
+            remainingIn.Mul(remainingIn, big.NewInt(1e18))
+            remainingIn.Div(remainingIn, feeComplement)
+            return amountOut, remainingIn
+        }
+    }
+}
+
+// CalcSwapAcrossBins 计算跨多个 bin 的交换
+func (m *MaverickMath) CalcSwapAcrossBins(
+    pool *MaverickPool,
+    amountIn *big.Int,
+    tokenAIn bool,
+) *big.Int {
+    totalOut := big.NewInt(0)
+    remaining := new(big.Int).Set(amountIn)
+
+    activeBins := m.getActiveBins(pool, tokenAIn)
+
+    for _, binID := range activeBins {
+        if remaining.Sign() == 0 {
+            break
+        }
+
+        bin := pool.Bins[binID]
+        if bin == nil {
+            continue
+        }
+
+        out, newRemaining := m.CalcSwapInBin(bin, remaining, tokenAIn, pool.Fee)
+        totalOut.Add(totalOut, out)
+        remaining = newRemaining
+    }
+
+    return totalOut
+}
+
+// getActiveBins 获取活跃的 bins (按价格排序)
+func (m *MaverickMath) getActiveBins(pool *MaverickPool, tokenAIn bool) []int64 {
+    var bins []int64
+
+    for binID := range pool.Bins {
+        bins = append(bins, binID)
+    }
+
+    // A->B: 升序, B->A: 降序
+    if tokenAIn {
+        for i := 0; i < len(bins)-1; i++ {
+            for j := i + 1; j < len(bins); j++ {
+                if bins[i] > bins[j] {
+                    bins[i], bins[j] = bins[j], bins[i]
+                }
+            }
+        }
+    } else {
+        for i := 0; i < len(bins)-1; i++ {
+            for j := i + 1; j < len(bins); j++ {
+                if bins[i] < bins[j] {
+                    bins[i], bins[j] = bins[j], bins[i]
+                }
+            }
+        }
+    }
+
+    return bins
+}
+```
+
+### B.4 Balancer 套利检测
+
+```go
+// BalancerArbitrageDetector Balancer 套利检测器
+type BalancerArbitrageDetector struct {
+    math *BalancerMath
+}
+
+// FindArbitrageOpportunities 查找套利机会
+func (d *BalancerArbitrageDetector) FindArbitrageOpportunities(
+    pool *BalancerWeightedPool,
+    externalPrices map[string]*big.Float,
+) []BalancerArbitrageOpportunity {
+    var opportunities []BalancerArbitrageOpportunity
+
+    for i := 0; i < len(pool.Tokens); i++ {
+        for j := 0; j < len(pool.Tokens); j++ {
+            if i == j {
+                continue
+            }
+
+            spotPrice := d.math.CalcSpotPrice(
+                pool.Balances[i],
+                pool.Weights[i],
+                pool.Balances[j],
+                pool.Weights[j],
+                pool.SwapFee,
+            )
+
+            pairKey := pool.Tokens[i].Hex() + "-" + pool.Tokens[j].Hex()
+            externalPrice, ok := externalPrices[pairKey]
+            if !ok {
+                continue
+            }
+
+            diff := new(big.Float).Sub(externalPrice, spotPrice)
+            ratio := new(big.Float).Quo(diff, spotPrice)
+            ratioF, _ := ratio.Float64()
+
+            if ratioF > 0.001 || ratioF < -0.001 {
+                optimalAmount := d.calculateOptimalAmount(pool, i, j, ratioF)
+                profit := d.calculateExpectedProfit(pool, i, j, optimalAmount)
+
+                opportunities = append(opportunities, BalancerArbitrageOpportunity{
+                    PoolAddress:    pool.Address,
+                    TokenIn:        pool.Tokens[i],
+                    TokenOut:       pool.Tokens[j],
+                    OptimalAmount:  optimalAmount,
+                    ExpectedProfit: profit,
+                    SpotPrice:      spotPrice,
+                    ExternalPrice:  externalPrice,
+                    PriceDiffBps:   int(ratioF * 10000),
+                })
+            }
+        }
+    }
+
+    return opportunities
+}
+
+// BalancerArbitrageOpportunity 套利机会
+type BalancerArbitrageOpportunity struct {
+    PoolAddress    common.Address
+    TokenIn        common.Address
+    TokenOut       common.Address
+    OptimalAmount  *big.Int
+    ExpectedProfit *big.Int
+    SpotPrice      *big.Float
+    ExternalPrice  *big.Float
+    PriceDiffBps   int
+}
+
+func (d *BalancerArbitrageDetector) calculateOptimalAmount(
+    pool *BalancerWeightedPool,
+    tokenInIndex int,
+    tokenOutIndex int,
+    priceDiff float64,
+) *big.Int {
+    balanceIn := pool.Balances[tokenInIndex]
+
+    low := big.NewInt(0)
+    high := new(big.Int).Div(balanceIn, big.NewInt(2))
+
+    maxProfit := big.NewInt(0)
+    optimalAmount := big.NewInt(0)
+
+    for iterations := 0; iterations < 100; iterations++ {
+        mid := new(big.Int).Add(low, high)
+        mid.Div(mid, big.NewInt(2))
+
+        if mid.Cmp(low) == 0 {
+            break
+        }
+
+        profit := d.calculateExpectedProfit(pool, tokenInIndex, tokenOutIndex, mid)
+
+        if profit.Cmp(maxProfit) > 0 {
+            maxProfit.Set(profit)
+            optimalAmount.Set(mid)
+        }
+
+        higherMid := new(big.Int).Add(mid, new(big.Int).Sub(high, mid).Div(new(big.Int).Sub(high, mid), big.NewInt(2)))
+        higherProfit := d.calculateExpectedProfit(pool, tokenInIndex, tokenOutIndex, higherMid)
+
+        if higherProfit.Cmp(profit) > 0 {
+            low.Set(mid)
+        } else {
+            high.Set(mid)
+        }
+    }
+
+    return optimalAmount
+}
+
+func (d *BalancerArbitrageDetector) calculateExpectedProfit(
+    pool *BalancerWeightedPool,
+    tokenInIndex int,
+    tokenOutIndex int,
+    amountIn *big.Int,
+) *big.Int {
+    amountOut := d.math.CalcOutGivenIn(
+        pool.Balances[tokenInIndex],
+        pool.Weights[tokenInIndex],
+        pool.Balances[tokenOutIndex],
+        pool.Weights[tokenOutIndex],
+        amountIn,
+        pool.SwapFee,
+    )
+
+    return new(big.Int).Sub(amountOut, amountIn)
+}
+```
+
+### B.5 Maverick 套利策略
+
+```go
+// MaverickArbitrageStrategy Maverick 套利策略
+type MaverickArbitrageStrategy struct {
+    math *MaverickMath
+}
+
+// FindArbitrageOpportunity 查找套利机会
+func (s *MaverickArbitrageStrategy) FindArbitrageOpportunity(
+    pool *MaverickPool,
+    marketPrice *big.Float,
+    minProfitBps int,
+) *MaverickArbitrageOpportunity {
+    maverickPrice := s.math.TickToPrice(pool.ActiveTick)
+
+    marketPriceF, _ := marketPrice.Float64()
+    maverickPriceF, _ := maverickPrice.Float64()
+
+    priceDiff := (marketPriceF - maverickPriceF) / maverickPriceF
+
+    if priceDiff > float64(minProfitBps)/10000 {
+        // 市场价格高: B -> A
+        return s.optimizeArbitrage(pool, false, marketPrice)
+    } else if priceDiff < -float64(minProfitBps)/10000 {
+        // 市场价格低: A -> B
+        return s.optimizeArbitrage(pool, true, marketPrice)
+    }
+
+    return nil
+}
+
+// MaverickArbitrageOpportunity Maverick 套利机会
+type MaverickArbitrageOpportunity struct {
+    Pool           *MaverickPool
+    TokenAIn       bool
+    AmountIn       *big.Int
+    ExpectedOut    *big.Int
+    EffectivePrice *big.Float
+    MarketPrice    *big.Float
+    ProfitBps      int
+}
+
+func (s *MaverickArbitrageStrategy) optimizeArbitrage(
+    pool *MaverickPool,
+    tokenAIn bool,
+    marketPrice *big.Float,
+) *MaverickArbitrageOpportunity {
+    var maxReserve *big.Int
+    if tokenAIn {
+        maxReserve = s.getTotalReserveB(pool)
+    } else {
+        maxReserve = s.getTotalReserveA(pool)
+    }
+
+    low := big.NewInt(1e15)
+    high := new(big.Int).Div(maxReserve, big.NewInt(2))
+
+    bestOpp := &MaverickArbitrageOpportunity{}
+    bestProfit := big.NewInt(0)
+
+    for iterations := 0; iterations < 50; iterations++ {
+        mid := new(big.Int).Add(low, high)
+        mid.Div(mid, big.NewInt(2))
+
+        if mid.Cmp(low) == 0 {
+            break
+        }
+
+        amountOut := s.math.CalcSwapAcrossBins(pool, mid, tokenAIn)
+        profit := s.calculateProfit(mid, amountOut, tokenAIn, marketPrice)
+
+        if profit.Cmp(bestProfit) > 0 {
+            bestProfit.Set(profit)
+
+            effectivePrice := new(big.Float).Quo(
+                new(big.Float).SetInt(amountOut),
+                new(big.Float).SetInt(mid),
+            )
+
+            marketPriceF, _ := marketPrice.Float64()
+            effectivePriceF, _ := effectivePrice.Float64()
+
+            profitBps := int((effectivePriceF - marketPriceF) / marketPriceF * 10000)
+
+            bestOpp = &MaverickArbitrageOpportunity{
+                Pool:           pool,
+                TokenAIn:       tokenAIn,
+                AmountIn:       new(big.Int).Set(mid),
+                ExpectedOut:    amountOut,
+                EffectivePrice: effectivePrice,
+                MarketPrice:    marketPrice,
+                ProfitBps:      profitBps,
+            }
+        }
+
+        higherMid := new(big.Int).Add(mid, new(big.Int).Div(new(big.Int).Sub(high, mid), big.NewInt(2)))
+        higherOut := s.math.CalcSwapAcrossBins(pool, higherMid, tokenAIn)
+        higherProfit := s.calculateProfit(higherMid, higherOut, tokenAIn, marketPrice)
+
+        if higherProfit.Cmp(profit) > 0 {
+            low.Set(mid)
+        } else {
+            high.Set(mid)
+        }
+    }
+
+    if bestProfit.Sign() > 0 {
+        return bestOpp
+    }
+
+    return nil
+}
+
+func (s *MaverickArbitrageStrategy) calculateProfit(
+    amountIn *big.Int,
+    amountOut *big.Int,
+    tokenAIn bool,
+    marketPrice *big.Float,
+) *big.Int {
+    amountInF := new(big.Float).SetInt(amountIn)
+    amountOutF := new(big.Float).SetInt(amountOut)
+
+    if tokenAIn {
+        marketPriceF, _ := marketPrice.Float64()
+        valueInA := new(big.Float).Quo(amountOutF, big.NewFloat(marketPriceF))
+        profit := new(big.Float).Sub(valueInA, amountInF)
+        profitInt, _ := profit.Int(nil)
+        return profitInt
+    } else {
+        marketPriceF, _ := marketPrice.Float64()
+        valueInB := new(big.Float).Mul(amountOutF, big.NewFloat(marketPriceF))
+        profit := new(big.Float).Sub(valueInB, amountInF)
+        profitInt, _ := profit.Int(nil)
+        return profitInt
+    }
+}
+
+func (s *MaverickArbitrageStrategy) getTotalReserveA(pool *MaverickPool) *big.Int {
+    total := big.NewInt(0)
+    for _, bin := range pool.Bins {
+        total.Add(total, bin.ReserveA)
+    }
+    return total
+}
+
+func (s *MaverickArbitrageStrategy) getTotalReserveB(pool *MaverickPool) *big.Int {
+    total := big.NewInt(0)
+    for _, bin := range pool.Bins {
+        total.Add(total, bin.ReserveB)
+    }
+    return total
+}
+```
+
+### B.6 总结
+
+Balancer 和 Maverick 代表了 DeFi 中两种创新的 AMM 设计：
+
+1. **Balancer 加权池**: 公式 `V = ∏(Bi^Wi)` 允许非对称权重
+2. **Balancer Composable Stable**: 结合 Curve StableSwap，适用于稳定资产
+3. **Maverick Bin 模型**: 流动性可根据价格变动自动调整位置
+
+关键数学要点：
+- Balancer: `Ao = Bo × (1 - (Bi / (Bi + Ai))^(Wi/Wo))`
+- Maverick: 单 bin 内 `dy = dx × p × (1 - fee)`，跨 bin 需累加

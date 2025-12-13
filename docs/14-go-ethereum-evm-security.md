@@ -1332,3 +1332,874 @@ func (r *AuditReport) GenerateReport() string {
 14. 安全与漏洞
 
 希望这些内容能帮助您深入理解以太坊 EVM 和 DeFi 生态系统！
+
+---
+
+## 附录 A：形式化验证工具
+
+形式化验证是使用数学方法证明智能合约满足特定属性的技术。本附录介绍主流形式化验证工具的使用方法。
+
+### A.1 Slither - 静态分析
+
+Slither 是 Trail of Bits 开发的 Solidity 静态分析框架，可以检测常见漏洞。
+
+```bash
+# 安装
+pip3 install slither-analyzer
+
+# 基本使用
+slither contracts/ArbitrageBot.sol
+
+# 输出 JSON 格式
+slither contracts/ --json output.json
+
+# 只检查特定检测器
+slither contracts/ --detect reentrancy-eth,arbitrary-send
+
+# 排除特定检测器
+slither contracts/ --exclude naming-convention,solc-version
+
+# 生成调用图
+slither contracts/ --print call-graph
+
+# 生成继承图
+slither contracts/ --print inheritance-graph
+
+# 检测函数摘要
+slither contracts/ --print function-summary
+```
+
+**自定义检测器：**
+
+```python
+# custom_detector.py
+from slither.detectors.abstract_detector import AbstractDetector, DetectorClassification
+from slither.core.declarations import Function
+
+class FlashLoanCallbackDetector(AbstractDetector):
+    """
+    检测未保护的闪电贷回调
+    """
+    ARGUMENT = "unprotected-flash-callback"
+    HELP = "Unprotected flash loan callback"
+    IMPACT = DetectorClassification.HIGH
+    CONFIDENCE = DetectorClassification.MEDIUM
+
+    WIKI = "https://example.com/wiki/unprotected-flash-callback"
+    WIKI_TITLE = "Unprotected Flash Loan Callback"
+    WIKI_DESCRIPTION = "Flash loan callbacks should verify the caller"
+
+    def _detect(self):
+        results = []
+
+        for contract in self.compilation_unit.contracts_derived:
+            for function in contract.functions:
+                if self._is_flash_callback(function):
+                    if not self._has_caller_check(function):
+                        info = [
+                            function,
+                            " is a flash loan callback without caller verification\n"
+                        ]
+                        res = self.generate_result(info)
+                        results.append(res)
+
+        return results
+
+    def _is_flash_callback(self, function: Function) -> bool:
+        callback_names = [
+            "uniswapV2Call",
+            "uniswapV3FlashCallback",
+            "executeOperation",  # Aave
+            "onFlashLoan",       # ERC-3156
+        ]
+        return function.name in callback_names
+
+    def _has_caller_check(self, function: Function) -> bool:
+        # 检查是否有 msg.sender 验证
+        for node in function.nodes:
+            if "msg.sender" in str(node) and "require" in str(node):
+                return True
+        return False
+
+
+# 使用自定义检测器
+# slither contracts/ --detect custom_detector
+```
+
+**Slither 集成到 CI：**
+
+```yaml
+# .github/workflows/security.yml
+name: Security Analysis
+
+on: [push, pull_request]
+
+jobs:
+  slither:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run Slither
+        uses: crytic/slither-action@v0.3.0
+        with:
+          target: 'contracts/'
+          slither-args: '--exclude naming-convention --json slither-report.json'
+          fail-on: 'high'
+
+      - name: Upload Slither Report
+        uses: actions/upload-artifact@v4
+        with:
+          name: slither-report
+          path: slither-report.json
+```
+
+### A.2 Echidna - 模糊测试
+
+Echidna 是基于属性的模糊测试工具，可以自动发现违反不变量的输入。
+
+```solidity
+// contracts/ArbitrageBotEchidna.sol
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.19;
+
+import "./ArbitrageBot.sol";
+
+contract ArbitrageBotEchidna is ArbitrageBot {
+    // 不变量：合约余额不应该减少（除了预期的提款）
+    uint256 internal initialBalance;
+    bool internal initialized;
+
+    constructor() ArbitrageBot(msg.sender) {
+        initialBalance = address(this).balance;
+        initialized = true;
+    }
+
+    // Echidna 会尝试找到使这个函数返回 false 的输入
+    function echidna_balance_never_decreases() public view returns (bool) {
+        if (!initialized) return true;
+        return address(this).balance >= initialBalance;
+    }
+
+    // 不变量：owner 永远不应该改变
+    address internal immutable originalOwner = msg.sender;
+
+    function echidna_owner_never_changes() public view returns (bool) {
+        return owner() == originalOwner;
+    }
+
+    // 不变量：紧急暂停后不应该能执行交易
+    function echidna_paused_blocks_execution() public view returns (bool) {
+        if (paused()) {
+            // 如果暂停了，不应该有待处理的交易
+            return pendingTransactions() == 0;
+        }
+        return true;
+    }
+
+    // 测试闪电贷回调的安全性
+    bool internal flashLoanInProgress;
+
+    function echidna_flash_loan_atomic() public view returns (bool) {
+        // 闪电贷应该在同一交易内完成
+        return !flashLoanInProgress;
+    }
+
+    // 模拟恶意调用
+    function maliciousCallback(
+        address token,
+        uint256 amount,
+        uint256 fee,
+        bytes calldata data
+    ) external {
+        // 尝试重入攻击
+        if (address(this).balance > 0) {
+            // 这应该失败
+            this.executeArbitrage(data);
+        }
+    }
+}
+
+// 测试 AMM 数学的正确性
+contract AMMInvariantsEchidna {
+    uint256 constant PRECISION = 1e18;
+
+    uint256 public reserveA = 1000 * PRECISION;
+    uint256 public reserveB = 1000 * PRECISION;
+    uint256 public k;
+
+    constructor() {
+        k = reserveA * reserveB;
+    }
+
+    // 模拟交换
+    function swap(uint256 amountIn, bool aToB) public {
+        require(amountIn > 0 && amountIn < (aToB ? reserveA : reserveB) / 2);
+
+        uint256 amountInWithFee = amountIn * 997; // 0.3% fee
+
+        if (aToB) {
+            uint256 amountOut = (amountInWithFee * reserveB) / (reserveA * 1000 + amountInWithFee);
+            reserveA += amountIn;
+            reserveB -= amountOut;
+        } else {
+            uint256 amountOut = (amountInWithFee * reserveA) / (reserveB * 1000 + amountInWithFee);
+            reserveB += amountIn;
+            reserveA -= amountOut;
+        }
+    }
+
+    // 不变量：k 应该只增加（因为手续费）
+    function echidna_k_never_decreases() public view returns (bool) {
+        return reserveA * reserveB >= k;
+    }
+
+    // 不变量：储备金不应该为零
+    function echidna_reserves_positive() public view returns (bool) {
+        return reserveA > 0 && reserveB > 0;
+    }
+
+    // 不变量：不应该有无限套利机会
+    function echidna_no_free_money() public view returns (bool) {
+        // 如果价格相等，不应该有套利空间
+        if (reserveA == reserveB) {
+            // 买入再卖出应该亏损
+            uint256 testAmount = PRECISION;
+            uint256 out1 = getAmountOut(testAmount, reserveA, reserveB);
+            uint256 out2 = getAmountOut(out1, reserveB - out1, reserveA + testAmount);
+            return out2 < testAmount;
+        }
+        return true;
+    }
+
+    function getAmountOut(uint256 amountIn, uint256 resIn, uint256 resOut) internal pure returns (uint256) {
+        uint256 amountInWithFee = amountIn * 997;
+        return (amountInWithFee * resOut) / (resIn * 1000 + amountInWithFee);
+    }
+}
+```
+
+**Echidna 配置：**
+
+```yaml
+# echidna.yaml
+testMode: assertion
+testLimit: 50000
+seqLen: 100
+shrinkLimit: 5000
+coverage: true
+corpusDir: "corpus"
+
+# 部署配置
+deployer: "0x10000"
+sender: ["0x10000", "0x20000", "0x30000"]
+
+# 过滤函数
+filterFunctions: ["echidna_"]
+
+# 合约余额
+balanceContract: 10000000000000000000
+
+# Solc 配置
+cryticArgs: ["--solc-remaps", "@openzeppelin=node_modules/@openzeppelin"]
+```
+
+```bash
+# 运行 Echidna
+echidna contracts/ArbitrageBotEchidna.sol --contract ArbitrageBotEchidna --config echidna.yaml
+
+# 查看覆盖率
+echidna contracts/ArbitrageBotEchidna.sol --contract ArbitrageBotEchidna --coverage
+```
+
+### A.3 Certora Prover - 形式化验证
+
+Certora 是最强大的形式化验证工具，使用 CVL（Certora Verification Language）编写规范。
+
+```cvl
+// specs/ArbitrageBot.spec
+// Certora 规范文件
+
+methods {
+    function owner() external returns (address) envfree;
+    function paused() external returns (bool) envfree;
+    function balanceOf(address) external returns (uint256) envfree;
+    function executeArbitrage(bytes) external;
+    function emergencyWithdraw(address) external;
+    function pause() external;
+    function unpause() external;
+}
+
+// 定义 Ghost 变量跟踪状态
+ghost uint256 totalExecutions;
+ghost uint256 totalProfit;
+
+// 钩子：在每次执行套利后更新
+hook Sstore currentNonce uint256 newValue (uint256 oldValue) STORAGE {
+    totalExecutions = totalExecutions + 1;
+}
+
+// 规则1：只有 owner 可以提款
+rule onlyOwnerCanWithdraw(address token) {
+    env e;
+
+    address ownerBefore = owner();
+
+    emergencyWithdraw(e, token);
+
+    assert e.msg.sender == ownerBefore, "Only owner should withdraw";
+}
+
+// 规则2：暂停时不能执行套利
+rule pausedBlocksExecution(bytes data) {
+    env e;
+
+    bool isPaused = paused();
+
+    executeArbitrage@withrevert(e, data);
+
+    assert isPaused => lastReverted, "Should revert when paused";
+}
+
+// 规则3：余额不变量
+rule balanceInvariant(bytes data) {
+    env e;
+
+    uint256 balanceBefore = balanceOf(e.msg.sender);
+
+    executeArbitrage(e, data);
+
+    uint256 balanceAfter = balanceOf(e.msg.sender);
+
+    // 余额应该增加或保持不变（套利利润）
+    assert balanceAfter >= balanceBefore, "Balance should not decrease";
+}
+
+// 规则4：闪电贷原子性
+rule flashLoanAtomicity(bytes data) {
+    env e;
+
+    uint256 contractBalanceBefore = nativeBalances[currentContract];
+
+    executeArbitrage(e, data);
+
+    uint256 contractBalanceAfter = nativeBalances[currentContract];
+
+    // 交易结束后，合约余额应该至少和之前一样（扣除 gas）
+    assert contractBalanceAfter >= contractBalanceBefore, "Flash loan must be repaid";
+}
+
+// 规则5：不应该有重入
+rule noReentrancy(bytes data1, bytes data2) {
+    env e1;
+    env e2;
+
+    // 如果第一个调用正在执行
+    storage init = lastStorage;
+
+    executeArbitrage(e1, data1);
+
+    // 第二个调用应该失败（重入保护）
+    executeArbitrage@withrevert(e2, data2) at init;
+
+    assert lastReverted, "Reentrancy should be blocked";
+}
+
+// 不变量：owner 地址不为零
+invariant ownerNotZero()
+    owner() != 0
+    {
+        preserved {
+            require owner() != 0;
+        }
+    }
+
+// 不变量：暂停状态一致性
+invariant pauseConsistency()
+    paused() => totalExecutions == 0
+    {
+        preserved pause() {
+            require !paused();
+        }
+    }
+
+// 参数化规则：测试不同代币
+rule withdrawAnyToken(address token, uint256 amount) {
+    env e;
+
+    require e.msg.sender == owner();
+    require amount > 0;
+
+    uint256 balanceBefore = balanceOf(token);
+
+    emergencyWithdraw(e, token);
+
+    uint256 balanceAfter = balanceOf(token);
+
+    assert balanceAfter <= balanceBefore, "Withdrawal successful";
+}
+```
+
+**Certora 配置：**
+
+```json
+// certora.conf.json
+{
+    "files": [
+        "contracts/ArbitrageBot.sol"
+    ],
+    "verify": "ArbitrageBot:specs/ArbitrageBot.spec",
+    "solc": "solc",
+    "optimistic_loop": true,
+    "loop_iter": 3,
+    "rule_sanity": "basic",
+    "msg": "ArbitrageBot verification",
+    "packages": [
+        "@openzeppelin=node_modules/@openzeppelin"
+    ]
+}
+```
+
+```bash
+# 运行 Certora
+certoraRun certora.conf.json
+
+# 运行特定规则
+certoraRun certora.conf.json --rule onlyOwnerCanWithdraw
+
+# 调试模式
+certoraRun certora.conf.json --debug
+```
+
+### A.4 Mythril - 符号执行
+
+Mythril 使用符号执行来发现安全漏洞。
+
+```bash
+# 安装
+pip3 install mythril
+
+# 基本分析
+myth analyze contracts/ArbitrageBot.sol
+
+# 深度分析
+myth analyze contracts/ArbitrageBot.sol --execution-timeout 3600 --max-depth 50
+
+# 分析已部署合约
+myth analyze --address 0x1234... --rpc infura-mainnet
+
+# 输出 JSON
+myth analyze contracts/ArbitrageBot.sol -o json > mythril-report.json
+
+# 只检测特定漏洞
+myth analyze contracts/ArbitrageBot.sol --modules ether_thief,suicide
+```
+
+**Mythril 自动化脚本：**
+
+```python
+# mythril_analysis.py
+from mythril.mythril import MythrilDisassembler, MythrilAnalyzer
+from mythril.analysis.report import Report
+import json
+
+def analyze_contract(contract_path: str, timeout: int = 300) -> dict:
+    """
+    使用 Mythril 分析合约
+    """
+    # 初始化
+    disassembler = MythrilDisassembler()
+    disassembler.load_from_solidity([contract_path])
+
+    # 创建分析器
+    analyzer = MythrilAnalyzer(
+        disassembler=disassembler,
+        strategy="bfs",  # 广度优先搜索
+        max_depth=50,
+        execution_timeout=timeout
+    )
+
+    # 执行分析
+    report = analyzer.fire_lasers(
+        modules=["ether_thief", "suicide", "delegatecall", "integer"]
+    )
+
+    # 解析结果
+    results = {
+        "issues": [],
+        "summary": {
+            "high": 0,
+            "medium": 0,
+            "low": 0
+        }
+    }
+
+    for issue in report.issues.values():
+        severity = issue.severity.lower()
+        results["summary"][severity] = results["summary"].get(severity, 0) + 1
+        results["issues"].append({
+            "title": issue.title,
+            "severity": severity,
+            "description": issue.description,
+            "location": f"{issue.filename}:{issue.lineno}",
+            "swc_id": issue.swc_id
+        })
+
+    return results
+
+def main():
+    contracts = [
+        "contracts/ArbitrageBot.sol",
+        "contracts/FlashLoanReceiver.sol",
+        "contracts/MultiDEXSwap.sol"
+    ]
+
+    all_results = {}
+
+    for contract in contracts:
+        print(f"Analyzing {contract}...")
+        results = analyze_contract(contract)
+        all_results[contract] = results
+
+        # 打印摘要
+        print(f"  High: {results['summary']['high']}")
+        print(f"  Medium: {results['summary']['medium']}")
+        print(f"  Low: {results['summary']['low']}")
+
+    # 保存完整报告
+    with open("mythril-report.json", "w") as f:
+        json.dump(all_results, f, indent=2)
+
+    print("\nFull report saved to mythril-report.json")
+
+if __name__ == "__main__":
+    main()
+```
+
+### A.5 Foundry 模糊测试
+
+Foundry 内置强大的模糊测试功能。
+
+```solidity
+// test/ArbitrageBot.t.sol
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.19;
+
+import "forge-std/Test.sol";
+import "../contracts/ArbitrageBot.sol";
+import "../contracts/mocks/MockERC20.sol";
+import "../contracts/mocks/MockUniswapV2Pair.sol";
+
+contract ArbitrageBotFuzzTest is Test {
+    ArbitrageBot public bot;
+    MockERC20 public tokenA;
+    MockERC20 public tokenB;
+    MockUniswapV2Pair public pairAB;
+
+    address public owner = address(1);
+    address public attacker = address(2);
+
+    function setUp() public {
+        vm.startPrank(owner);
+
+        // 部署代币
+        tokenA = new MockERC20("Token A", "TKA", 18);
+        tokenB = new MockERC20("Token B", "TKB", 18);
+
+        // 部署交易对
+        pairAB = new MockUniswapV2Pair(address(tokenA), address(tokenB));
+
+        // 添加流动性
+        tokenA.mint(address(pairAB), 1000000e18);
+        tokenB.mint(address(pairAB), 1000000e18);
+        pairAB.sync();
+
+        // 部署套利机器人
+        bot = new ArbitrageBot(owner);
+
+        vm.stopPrank();
+    }
+
+    // 模糊测试：任意金额的交换不应该导致负余额
+    function testFuzz_SwapNeverNegativeBalance(uint256 amountIn) public {
+        // 限制输入范围
+        amountIn = bound(amountIn, 1e15, 100000e18);
+
+        // 给机器人一些代币
+        tokenA.mint(address(bot), amountIn);
+
+        uint256 balanceBefore = tokenA.balanceOf(address(bot));
+
+        // 构建交换数据
+        bytes memory swapData = abi.encodeWithSelector(
+            bot.executeSwap.selector,
+            address(pairAB),
+            address(tokenA),
+            address(tokenB),
+            amountIn,
+            0 // minOut
+        );
+
+        vm.prank(owner);
+        try bot.execute(swapData) {} catch {}
+
+        uint256 balanceAfter = tokenA.balanceOf(address(bot));
+
+        // 余额不应该变成负数（Solidity 会 revert）
+        assertTrue(balanceAfter >= 0);
+    }
+
+    // 模糊测试：非 owner 不能执行敏感操作
+    function testFuzz_OnlyOwnerCanExecute(address caller, bytes calldata data) public {
+        vm.assume(caller != owner);
+        vm.assume(caller != address(0));
+
+        vm.prank(caller);
+        vm.expectRevert("Ownable: caller is not the owner");
+        bot.execute(data);
+    }
+
+    // 模糊测试：暂停后不能执行
+    function testFuzz_PausedBlocksExecution(bytes calldata data) public {
+        vm.prank(owner);
+        bot.pause();
+
+        vm.prank(owner);
+        vm.expectRevert("Pausable: paused");
+        bot.execute(data);
+    }
+
+    // 模糊测试：滑点保护
+    function testFuzz_SlippageProtection(
+        uint256 amountIn,
+        uint256 minAmountOut,
+        uint256 reserveA,
+        uint256 reserveB
+    ) public {
+        // 绑定合理范围
+        amountIn = bound(amountIn, 1e15, 1000e18);
+        reserveA = bound(reserveA, 10000e18, 10000000e18);
+        reserveB = bound(reserveB, 10000e18, 10000000e18);
+
+        // 设置池储备
+        tokenA.mint(address(pairAB), reserveA);
+        tokenB.mint(address(pairAB), reserveB);
+        pairAB.setReserves(reserveA, reserveB);
+
+        // 计算预期输出
+        uint256 expectedOut = getAmountOut(amountIn, reserveA, reserveB);
+
+        // 设置不合理的最小输出
+        minAmountOut = bound(minAmountOut, expectedOut + 1, type(uint256).max);
+
+        tokenA.mint(address(bot), amountIn);
+
+        bytes memory swapData = abi.encodeWithSelector(
+            bot.executeSwapWithSlippage.selector,
+            address(pairAB),
+            address(tokenA),
+            address(tokenB),
+            amountIn,
+            minAmountOut
+        );
+
+        vm.prank(owner);
+        vm.expectRevert("Slippage too high");
+        bot.execute(swapData);
+    }
+
+    // 模糊测试：闪电贷必须归还
+    function testFuzz_FlashLoanMustRepay(uint256 borrowAmount) public {
+        borrowAmount = bound(borrowAmount, 1e18, 100000e18);
+
+        // 设置闪电贷池
+        tokenA.mint(address(pairAB), borrowAmount * 2);
+
+        // 如果不归还，应该 revert
+        bytes memory maliciousCallback = abi.encodeWithSelector(
+            bot.maliciousFlashLoanCallback.selector
+        );
+
+        vm.prank(owner);
+        vm.expectRevert(); // 应该失败
+        bot.initiateFlashLoan(address(pairAB), borrowAmount, maliciousCallback);
+    }
+
+    // 不变量测试
+    function invariant_ownerNeverChanges() public {
+        assertEq(bot.owner(), owner);
+    }
+
+    function invariant_contractBalanceNonNegative() public {
+        assertTrue(address(bot).balance >= 0);
+        assertTrue(tokenA.balanceOf(address(bot)) >= 0);
+        assertTrue(tokenB.balanceOf(address(bot)) >= 0);
+    }
+
+    // 辅助函数
+    function getAmountOut(
+        uint256 amountIn,
+        uint256 reserveIn,
+        uint256 reserveOut
+    ) internal pure returns (uint256) {
+        uint256 amountInWithFee = amountIn * 997;
+        uint256 numerator = amountInWithFee * reserveOut;
+        uint256 denominator = reserveIn * 1000 + amountInWithFee;
+        return numerator / denominator;
+    }
+}
+
+// 不变量测试 Handler
+contract BotHandler is Test {
+    ArbitrageBot public bot;
+    MockERC20 public tokenA;
+    MockERC20 public tokenB;
+
+    constructor(ArbitrageBot _bot, MockERC20 _tokenA, MockERC20 _tokenB) {
+        bot = _bot;
+        tokenA = _tokenA;
+        tokenB = _tokenB;
+    }
+
+    function deposit(uint256 amount) public {
+        amount = bound(amount, 0, 1000e18);
+        tokenA.mint(address(bot), amount);
+    }
+
+    function withdraw(uint256 amount) public {
+        uint256 balance = tokenA.balanceOf(address(bot));
+        amount = bound(amount, 0, balance);
+
+        vm.prank(bot.owner());
+        bot.withdrawToken(address(tokenA), amount);
+    }
+
+    function pause() public {
+        vm.prank(bot.owner());
+        if (!bot.paused()) {
+            bot.pause();
+        }
+    }
+
+    function unpause() public {
+        vm.prank(bot.owner());
+        if (bot.paused()) {
+            bot.unpause();
+        }
+    }
+}
+```
+
+```bash
+# 运行模糊测试
+forge test --match-test testFuzz -vvv
+
+# 运行不变量测试
+forge test --match-test invariant -vvv
+
+# 设置模糊测试轮数
+forge test --match-test testFuzz --fuzz-runs 10000
+
+# 生成覆盖率报告
+forge coverage --report lcov
+```
+
+### A.6 工具对比与选择
+
+| 工具 | 类型 | 优势 | 劣势 | 适用场景 |
+|-----|------|------|------|---------|
+| **Slither** | 静态分析 | 快速、易用、可扩展 | 误报率较高 | CI/CD、快速检查 |
+| **Echidna** | 模糊测试 | 发现边界情况 | 需要写属性 | 数学逻辑验证 |
+| **Certora** | 形式化验证 | 数学证明、最全面 | 学习曲线陡峭 | 关键合约验证 |
+| **Mythril** | 符号执行 | 深度分析 | 速度慢 | 漏洞挖掘 |
+| **Foundry** | 模糊测试 | 集成开发、快速 | 功能相对基础 | 日常开发测试 |
+
+**推荐工作流：**
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                    安全验证工作流                             │
+├─────────────────────────────────────────────────────────────┤
+│                                                             │
+│  开发阶段                                                    │
+│  ├─ Slither (每次提交)                                      │
+│  └─ Foundry 模糊测试 (每次提交)                              │
+│       │                                                     │
+│       ▼                                                     │
+│  审计准备                                                    │
+│  ├─ Echidna 深度模糊 (属性验证)                              │
+│  ├─ Mythril 符号执行 (漏洞扫描)                              │
+│  └─ Certora 形式化验证 (关键属性)                            │
+│       │                                                     │
+│       ▼                                                     │
+│  部署前                                                      │
+│  ├─ 人工审计                                                │
+│  ├─ 主网 Fork 测试                                          │
+│  └─ 最终 Certora 验证                                       │
+│                                                             │
+└─────────────────────────────────────────────────────────────┘
+```
+
+**完整 CI 配置：**
+
+```yaml
+# .github/workflows/security-full.yml
+name: Full Security Analysis
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  slither:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: crytic/slither-action@v0.3.0
+        with:
+          target: 'contracts/'
+          fail-on: 'high'
+
+  echidna:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Echidna
+        run: |
+          wget https://github.com/crytic/echidna/releases/download/v2.2.0/echidna-2.2.0-Linux.zip
+          unzip echidna-2.2.0-Linux.zip
+          sudo mv echidna /usr/local/bin/
+      - name: Run Echidna
+        run: echidna contracts/test/Invariants.sol --config echidna.yaml
+
+  mythril:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Mythril
+        run: pip3 install mythril
+      - name: Run Mythril
+        run: myth analyze contracts/ArbitrageBot.sol --execution-timeout 600
+
+  foundry-fuzz:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: foundry-rs/foundry-toolchain@v1
+      - name: Run Fuzz Tests
+        run: forge test --match-test testFuzz --fuzz-runs 5000
+
+  certora:
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Certora
+        run: pip3 install certora-cli
+      - name: Run Certora
+        env:
+          CERTORAKEY: ${{ secrets.CERTORA_KEY }}
+        run: certoraRun certora.conf.json
+```

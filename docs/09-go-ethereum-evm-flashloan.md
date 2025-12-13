@@ -1575,3 +1575,1374 @@ Prevention: "考虑闪电贷场景的边界条件",
 闪电贷是 DeFi 最强大的工具之一，善用可以实现无本金套利，但也要了解其风险。
 
 下一篇将介绍 DEX 数学模型。
+
+---
+
+## 附录 A：新兴借贷协议闪电贷
+
+### A.1 Morpho 闪电贷
+
+Morpho 是建立在 Aave/Compound 之上的借贷优化层，提供了独特的闪电贷接口。
+
+```go
+// Morpho 闪电贷客户端
+package flashloan
+
+import (
+	"context"
+	"math/big"
+
+	"github.com/ethereum/go-ethereum/accounts/abi"
+	"github.com/ethereum/go-ethereum/accounts/abi/bind"
+	"github.com/ethereum/go-ethereum/common"
+	"github.com/ethereum/go-ethereum/core/types"
+	"github.com/ethereum/go-ethereum/ethclient"
+)
+
+// Morpho Blue 合约地址
+var (
+	MorphoBlueAddress = common.HexToAddress("0xBBBBBbbBBb9cC5e90e3b3Af64bdAF62C37EEFFCb")
+)
+
+// MorphoFlashLoan Morpho Blue 闪电贷实现
+type MorphoFlashLoan struct {
+	client   *ethclient.Client
+	morpho   *bind.BoundContract
+	morphoABI abi.ABI
+}
+
+// Morpho Blue 闪电贷接口
+const MorphoBlueABI = `[
+	{
+		"name": "flashLoan",
+		"type": "function",
+		"inputs": [
+			{"name": "token", "type": "address"},
+			{"name": "assets", "type": "uint256"},
+			{"name": "data", "type": "bytes"}
+		],
+		"outputs": []
+	},
+	{
+		"name": "idleMarketParams",
+		"type": "function",
+		"inputs": [{"name": "id", "type": "bytes32"}],
+		"outputs": [
+			{"name": "loanToken", "type": "address"},
+			{"name": "collateralToken", "type": "address"},
+			{"name": "oracle", "type": "address"},
+			{"name": "irm", "type": "address"},
+			{"name": "lltv", "type": "uint256"}
+		]
+	}
+]`
+
+func NewMorphoFlashLoan(client *ethclient.Client) (*MorphoFlashLoan, error) {
+	parsedABI, err := abi.JSON(strings.NewReader(MorphoBlueABI))
+	if err != nil {
+		return nil, err
+	}
+
+	contract := bind.NewBoundContract(MorphoBlueAddress, parsedABI, client, client, client)
+
+	return &MorphoFlashLoan{
+		client:    client,
+		morpho:    contract,
+		morphoABI: parsedABI,
+	}, nil
+}
+
+// FlashLoan 执行 Morpho Blue 闪电贷
+// Morpho Blue 特点：零手续费闪电贷
+func (m *MorphoFlashLoan) FlashLoan(
+	ctx context.Context,
+	token common.Address,
+	amount *big.Int,
+	receiver common.Address,
+	callbackData []byte,
+	opts *bind.TransactOpts,
+) (*types.Transaction, error) {
+	// Morpho Blue 闪电贷完全免费
+	// 只需在同一交易内还款即可
+
+	return m.morpho.Transact(opts, "flashLoan", token, amount, callbackData)
+}
+
+// GetAvailableLiquidity 获取可用流动性
+func (m *MorphoFlashLoan) GetAvailableLiquidity(
+	ctx context.Context,
+	token common.Address,
+) (*big.Int, error) {
+	// 查询 token 在 Morpho Blue 中的总供应
+	balance, err := m.getTokenBalance(ctx, token)
+	if err != nil {
+		return nil, err
+	}
+	return balance, nil
+}
+
+// MorphoFlashLoanCallback Morpho 闪电贷回调合约
+const MorphoFlashLoanCallbackSolidity = `
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.0;
+
+import {IMorpho} from "@morpho-org/morpho-blue/src/interfaces/IMorpho.sol";
+import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+
+contract MorphoFlashLoanReceiver {
+    IMorpho public immutable morpho;
+
+    constructor(address _morpho) {
+        morpho = IMorpho(_morpho);
+    }
+
+    // Morpho Blue 闪电贷回调
+    function onMorphoFlashLoan(uint256 assets, bytes calldata data) external {
+        require(msg.sender == address(morpho), "not morpho");
+
+        // 解码数据
+        (address token, address target, bytes memory payload) =
+            abi.decode(data, (address, address, bytes));
+
+        // 执行套利逻辑
+        (bool success,) = target.call(payload);
+        require(success, "arbitrage failed");
+
+        // 还款 - Morpho Blue 零手续费
+        IERC20(token).approve(address(morpho), assets);
+    }
+
+    // 执行闪电贷套利
+    function executeFlashLoan(
+        address token,
+        uint256 amount,
+        address target,
+        bytes calldata payload
+    ) external {
+        bytes memory data = abi.encode(token, target, payload);
+        morpho.flashLoan(token, amount, data);
+    }
+}
+`
+```
+
+### A.2 Euler Finance 闪电贷
+
+Euler V2 采用模块化设计，提供灵活的闪电贷功能。
+
+```go
+// Euler V2 闪电贷客户端
+package flashloan
+
+import (
+	"context"
+	"math/big"
+
+	"github.com/ethereum/go-ethereum/accounts/abi"
+	"github.com/ethereum/go-ethereum/accounts/abi/bind"
+	"github.com/ethereum/go-ethereum/common"
+	"github.com/ethereum/go-ethereum/ethclient"
+)
+
+// Euler V2 合约地址
+var (
+	EulerVaultFactoryAddress = common.HexToAddress("0x29a56a1b8214D9Cf7c5561811750D5cBDb45CC8e")
+)
+
+// EulerFlashLoan Euler V2 闪电贷
+type EulerFlashLoan struct {
+	client    *ethclient.Client
+	vaultABI  abi.ABI
+}
+
+// Euler Vault 闪电贷接口
+const EulerVaultABI = `[
+	{
+		"name": "flashLoan",
+		"type": "function",
+		"inputs": [
+			{"name": "amount", "type": "uint256"},
+			{"name": "data", "type": "bytes"}
+		],
+		"outputs": []
+	},
+	{
+		"name": "asset",
+		"type": "function",
+		"inputs": [],
+		"outputs": [{"name": "", "type": "address"}]
+	},
+	{
+		"name": "totalAssets",
+		"type": "function",
+		"inputs": [],
+		"outputs": [{"name": "", "type": "uint256"}]
+	},
+	{
+		"name": "maxFlashLoan",
+		"type": "function",
+		"inputs": [{"name": "token", "type": "address"}],
+		"outputs": [{"name": "", "type": "uint256"}]
+	},
+	{
+		"name": "flashFee",
+		"type": "function",
+		"inputs": [
+			{"name": "token", "type": "address"},
+			{"name": "amount", "type": "uint256"}
+		],
+		"outputs": [{"name": "", "type": "uint256"}]
+	}
+]`
+
+// EulerVault 单个 Vault 的闪电贷封装
+type EulerVault struct {
+	Address common.Address
+	Asset   common.Address
+	client  *EulerFlashLoan
+	contract *bind.BoundContract
+}
+
+func NewEulerFlashLoan(client *ethclient.Client) (*EulerFlashLoan, error) {
+	parsedABI, err := abi.JSON(strings.NewReader(EulerVaultABI))
+	if err != nil {
+		return nil, err
+	}
+
+	return &EulerFlashLoan{
+		client:   client,
+		vaultABI: parsedABI,
+	}, nil
+}
+
+// GetVault 获取特定资产的 Vault
+func (e *EulerFlashLoan) GetVault(vaultAddress common.Address) (*EulerVault, error) {
+	contract := bind.NewBoundContract(vaultAddress, e.vaultABI, e.client, e.client, e.client)
+
+	// 获取 asset
+	var results []interface{}
+	err := contract.Call(nil, &results, "asset")
+	if err != nil {
+		return nil, err
+	}
+
+	return &EulerVault{
+		Address:  vaultAddress,
+		Asset:    results[0].(common.Address),
+		client:   e,
+		contract: contract,
+	}, nil
+}
+
+// MaxFlashLoan 获取最大可借额度
+func (v *EulerVault) MaxFlashLoan(ctx context.Context) (*big.Int, error) {
+	var results []interface{}
+	err := v.contract.Call(&bind.CallOpts{Context: ctx}, &results, "maxFlashLoan", v.Asset)
+	if err != nil {
+		return nil, err
+	}
+	return results[0].(*big.Int), nil
+}
+
+// FlashFee 获取闪电贷费用
+func (v *EulerVault) FlashFee(ctx context.Context, amount *big.Int) (*big.Int, error) {
+	var results []interface{}
+	err := v.contract.Call(&bind.CallOpts{Context: ctx}, &results, "flashFee", v.Asset, amount)
+	if err != nil {
+		return nil, err
+	}
+	return results[0].(*big.Int), nil
+}
+
+// Euler V2 遵循 EIP-3156 标准
+const EulerFlashLoanReceiverSolidity = `
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.0;
+
+import {IERC3156FlashBorrower} from "@openzeppelin/contracts/interfaces/IERC3156FlashBorrower.sol";
+import {IERC3156FlashLender} from "@openzeppelin/contracts/interfaces/IERC3156FlashLender.sol";
+import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+
+contract EulerFlashLoanReceiver is IERC3156FlashBorrower {
+    // EIP-3156 回调函数签名
+    bytes32 public constant CALLBACK_SUCCESS = keccak256("ERC3156FlashBorrower.onFlashLoan");
+
+    // Euler Vault 地址映射
+    mapping(address => address) public vaults;  // token => vault
+
+    // EIP-3156 标准回调
+    function onFlashLoan(
+        address initiator,
+        address token,
+        uint256 amount,
+        uint256 fee,
+        bytes calldata data
+    ) external override returns (bytes32) {
+        require(vaults[token] == msg.sender, "untrusted lender");
+        require(initiator == address(this), "untrusted initiator");
+
+        // 解码并执行套利
+        (address target, bytes memory payload) = abi.decode(data, (address, bytes));
+        (bool success,) = target.call(payload);
+        require(success, "arbitrage failed");
+
+        // 还款 = 本金 + 手续费
+        IERC20(token).approve(msg.sender, amount + fee);
+
+        return CALLBACK_SUCCESS;
+    }
+
+    // 发起闪电贷
+    function flashBorrow(
+        address token,
+        uint256 amount,
+        address target,
+        bytes calldata payload
+    ) external {
+        address vault = vaults[token];
+        require(vault != address(0), "no vault");
+
+        bytes memory data = abi.encode(target, payload);
+        IERC3156FlashLender(vault).flashLoan(
+            IERC3156FlashBorrower(address(this)),
+            token,
+            amount,
+            data
+        );
+    }
+}
+`
+```
+
+### A.3 dYdX 闪电贷
+
+dYdX Solo Margin 提供了独特的闪电贷机制，通过操作序列实现。
+
+```go
+// dYdX Solo Margin 闪电贷
+package flashloan
+
+import (
+	"context"
+	"math/big"
+
+	"github.com/ethereum/go-ethereum/accounts/abi"
+	"github.com/ethereum/go-ethereum/accounts/abi/bind"
+	"github.com/ethereum/go-ethereum/common"
+	"github.com/ethereum/go-ethereum/ethclient"
+)
+
+// dYdX Solo Margin 地址 (Ethereum Mainnet)
+var (
+	DYDXSoloMarginAddress = common.HexToAddress("0x1E0447b19BB6EcFdAe1e4AE1694b0C3659614e4e")
+)
+
+// dYdX 市场 ID
+const (
+	DYDX_MARKET_WETH = 0
+	DYDX_MARKET_DAI  = 1  // 实际是 SAI
+	DYDX_MARKET_USDC = 2
+	DYDX_MARKET_DAI2 = 3  // 真正的 DAI
+)
+
+// DYDXFlashLoan dYdX 闪电贷客户端
+type DYDXFlashLoan struct {
+	client    *ethclient.Client
+	soloABI   abi.ABI
+	solo      *bind.BoundContract
+}
+
+// dYdX Solo Margin ABI
+const DYDXSoloABI = `[
+	{
+		"name": "operate",
+		"type": "function",
+		"inputs": [
+			{
+				"name": "accounts",
+				"type": "tuple[]",
+				"components": [
+					{"name": "owner", "type": "address"},
+					{"name": "number", "type": "uint256"}
+				]
+			},
+			{
+				"name": "actions",
+				"type": "tuple[]",
+				"components": [
+					{"name": "actionType", "type": "uint8"},
+					{"name": "accountId", "type": "uint256"},
+					{"name": "amount", "type": "tuple", "components": [
+						{"name": "sign", "type": "bool"},
+						{"name": "denomination", "type": "uint8"},
+						{"name": "ref", "type": "uint8"},
+						{"name": "value", "type": "uint256"}
+					]},
+					{"name": "primaryMarketId", "type": "uint256"},
+					{"name": "secondaryMarketId", "type": "uint256"},
+					{"name": "otherAddress", "type": "address"},
+					{"name": "otherAccountId", "type": "uint256"},
+					{"name": "data", "type": "bytes"}
+				]
+			}
+		],
+		"outputs": []
+	},
+	{
+		"name": "getMarketTokenAddress",
+		"type": "function",
+		"inputs": [{"name": "marketId", "type": "uint256"}],
+		"outputs": [{"name": "", "type": "address"}]
+	}
+]`
+
+// ActionType dYdX 操作类型
+type ActionType uint8
+
+const (
+	ActionDeposit    ActionType = 0
+	ActionWithdraw   ActionType = 1
+	ActionTransfer   ActionType = 2
+	ActionBuy        ActionType = 3
+	ActionSell       ActionType = 4
+	ActionTrade      ActionType = 5
+	ActionLiquidate  ActionType = 6
+	ActionVaporize   ActionType = 7
+	ActionCall       ActionType = 8  // 闪电贷用这个
+)
+
+// AccountInfo dYdX 账户信息
+type AccountInfo struct {
+	Owner  common.Address
+	Number *big.Int
+}
+
+// AssetAmount 资产数量
+type AssetAmount struct {
+	Sign         bool     // true = positive, false = negative
+	Denomination uint8    // 0 = Wei, 1 = Par
+	Ref          uint8    // 0 = Delta, 1 = Target
+	Value        *big.Int
+}
+
+// ActionArgs 操作参数
+type ActionArgs struct {
+	ActionType        ActionType
+	AccountId         *big.Int
+	Amount            AssetAmount
+	PrimaryMarketId   *big.Int
+	SecondaryMarketId *big.Int
+	OtherAddress      common.Address
+	OtherAccountId    *big.Int
+	Data              []byte
+}
+
+func NewDYDXFlashLoan(client *ethclient.Client) (*DYDXFlashLoan, error) {
+	parsedABI, err := abi.JSON(strings.NewReader(DYDXSoloABI))
+	if err != nil {
+		return nil, err
+	}
+
+	contract := bind.NewBoundContract(DYDXSoloMarginAddress, parsedABI, client, client, client)
+
+	return &DYDXFlashLoan{
+		client:  client,
+		soloABI: parsedABI,
+		solo:    contract,
+	}, nil
+}
+
+// BuildFlashLoanActions 构建闪电贷操作序列
+// dYdX 闪电贷原理：
+// 1. Withdraw - 借出资金
+// 2. Call - 执行自定义逻辑
+// 3. Deposit - 还款
+// 三个操作在同一交易内原子执行
+func (d *DYDXFlashLoan) BuildFlashLoanActions(
+	marketId *big.Int,
+	amount *big.Int,
+	callee common.Address,
+	data []byte,
+) []ActionArgs {
+	actions := make([]ActionArgs, 3)
+
+	// Action 1: Withdraw (借出)
+	actions[0] = ActionArgs{
+		ActionType: ActionWithdraw,
+		AccountId:  big.NewInt(0),
+		Amount: AssetAmount{
+			Sign:         false, // negative = withdraw
+			Denomination: 0,     // Wei
+			Ref:          0,     // Delta
+			Value:        amount,
+		},
+		PrimaryMarketId:   marketId,
+		SecondaryMarketId: big.NewInt(0),
+		OtherAddress:      callee,
+		OtherAccountId:    big.NewInt(0),
+		Data:              nil,
+	}
+
+	// Action 2: Call (执行自定义逻辑)
+	actions[1] = ActionArgs{
+		ActionType:        ActionCall,
+		AccountId:         big.NewInt(0),
+		Amount:            AssetAmount{},
+		PrimaryMarketId:   big.NewInt(0),
+		SecondaryMarketId: big.NewInt(0),
+		OtherAddress:      callee,
+		OtherAccountId:    big.NewInt(0),
+		Data:              data,
+	}
+
+	// Action 3: Deposit (还款)
+	// dYdX 闪电贷需要还款 amount + 2 wei (防止舍入误差)
+	repayAmount := new(big.Int).Add(amount, big.NewInt(2))
+	actions[2] = ActionArgs{
+		ActionType: ActionDeposit,
+		AccountId:  big.NewInt(0),
+		Amount: AssetAmount{
+			Sign:         true, // positive = deposit
+			Denomination: 0,
+			Ref:          0,
+			Value:        repayAmount,
+		},
+		PrimaryMarketId:   marketId,
+		SecondaryMarketId: big.NewInt(0),
+		OtherAddress:      callee,
+		OtherAccountId:    big.NewInt(0),
+		Data:              nil,
+	}
+
+	return actions
+}
+
+// dYdX 闪电贷回调合约
+const DYDXFlashLoanReceiverSolidity = `
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.0;
+
+import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+
+// dYdX Solo Margin 接口
+interface ISoloMargin {
+    struct AccountInfo {
+        address owner;
+        uint256 number;
+    }
+
+    struct AssetAmount {
+        bool sign;
+        uint8 denomination;
+        uint8 ref;
+        uint256 value;
+    }
+
+    struct ActionArgs {
+        uint8 actionType;
+        uint256 accountId;
+        AssetAmount amount;
+        uint256 primaryMarketId;
+        uint256 secondaryMarketId;
+        address otherAddress;
+        uint256 otherAccountId;
+        bytes data;
+    }
+
+    function operate(
+        AccountInfo[] calldata accounts,
+        ActionArgs[] calldata actions
+    ) external;
+
+    function getMarketTokenAddress(uint256 marketId) external view returns (address);
+}
+
+// dYdX Callee 接口
+interface ICallee {
+    function callFunction(
+        address sender,
+        AccountInfo calldata accountInfo,
+        bytes calldata data
+    ) external;
+}
+
+contract DYDXFlashLoanReceiver is ICallee {
+    ISoloMargin public immutable soloMargin;
+
+    // 市场 ID
+    uint256 constant MARKET_WETH = 0;
+    uint256 constant MARKET_USDC = 2;
+    uint256 constant MARKET_DAI = 3;
+
+    constructor(address _soloMargin) {
+        soloMargin = ISoloMargin(_soloMargin);
+    }
+
+    // dYdX 回调函数
+    function callFunction(
+        address sender,
+        AccountInfo calldata accountInfo,
+        bytes calldata data
+    ) external override {
+        require(msg.sender == address(soloMargin), "not solo margin");
+        require(sender == address(this), "not this contract");
+
+        // 解码套利参数
+        (
+            uint256 marketId,
+            uint256 amount,
+            address target,
+            bytes memory payload
+        ) = abi.decode(data, (uint256, uint256, address, bytes));
+
+        // 执行套利逻辑
+        (bool success,) = target.call(payload);
+        require(success, "arbitrage failed");
+
+        // 还款准备 - dYdX 需要额外 2 wei
+        address token = soloMargin.getMarketTokenAddress(marketId);
+        uint256 repayAmount = amount + 2;
+        IERC20(token).approve(address(soloMargin), repayAmount);
+    }
+
+    // 发起 dYdX 闪电贷
+    function initiateFlashLoan(
+        uint256 marketId,
+        uint256 amount,
+        address target,
+        bytes calldata payload
+    ) external {
+        // 构建账户
+        ISoloMargin.AccountInfo[] memory accounts = new ISoloMargin.AccountInfo[](1);
+        accounts[0] = ISoloMargin.AccountInfo({
+            owner: address(this),
+            number: 1
+        });
+
+        // 构建操作序列
+        ISoloMargin.ActionArgs[] memory actions = new ISoloMargin.ActionArgs[](3);
+
+        // 1. Withdraw
+        actions[0] = ISoloMargin.ActionArgs({
+            actionType: 1, // Withdraw
+            accountId: 0,
+            amount: ISoloMargin.AssetAmount({
+                sign: false,
+                denomination: 0,
+                ref: 0,
+                value: amount
+            }),
+            primaryMarketId: marketId,
+            secondaryMarketId: 0,
+            otherAddress: address(this),
+            otherAccountId: 0,
+            data: ""
+        });
+
+        // 2. Call
+        bytes memory callData = abi.encode(marketId, amount, target, payload);
+        actions[1] = ISoloMargin.ActionArgs({
+            actionType: 8, // Call
+            accountId: 0,
+            amount: ISoloMargin.AssetAmount({
+                sign: false,
+                denomination: 0,
+                ref: 0,
+                value: 0
+            }),
+            primaryMarketId: 0,
+            secondaryMarketId: 0,
+            otherAddress: address(this),
+            otherAccountId: 0,
+            data: callData
+        });
+
+        // 3. Deposit
+        actions[2] = ISoloMargin.ActionArgs({
+            actionType: 0, // Deposit
+            accountId: 0,
+            amount: ISoloMargin.AssetAmount({
+                sign: true,
+                denomination: 0,
+                ref: 0,
+                value: amount + 2
+            }),
+            primaryMarketId: marketId,
+            secondaryMarketId: 0,
+            otherAddress: address(this),
+            otherAccountId: 0,
+            data: ""
+        });
+
+        soloMargin.operate(accounts, actions);
+    }
+}
+`
+```
+
+### A.4 MakerDAO DAI Flash Mint
+
+MakerDAO 提供了 DAI 的闪电铸造功能，可以在单笔交易内无限铸造 DAI。
+
+```go
+// MakerDAO Flash Mint 客户端
+package flashloan
+
+import (
+	"context"
+	"math/big"
+
+	"github.com/ethereum/go-ethereum/accounts/abi"
+	"github.com/ethereum/go-ethereum/accounts/abi/bind"
+	"github.com/ethereum/go-ethereum/common"
+	"github.com/ethereum/go-ethereum/ethclient"
+)
+
+// MakerDAO 合约地址
+var (
+	DaiFlashMintAddress = common.HexToAddress("0x1EB4CF3A948E7D72A198fe073cCb8C7a948cD853")
+	DaiTokenAddress     = common.HexToAddress("0x6B175474E89094C44Da98b954EescdeCB5c3cD")
+)
+
+// DaiFlashMint DAI 闪电铸造客户端
+type DaiFlashMint struct {
+	client      *ethclient.Client
+	flashMint   *bind.BoundContract
+	flashABI    abi.ABI
+}
+
+// DAI Flash Mint ABI (EIP-3156)
+const DaiFlashMintABI = `[
+	{
+		"name": "flashLoan",
+		"type": "function",
+		"inputs": [
+			{"name": "receiver", "type": "address"},
+			{"name": "token", "type": "address"},
+			{"name": "amount", "type": "uint256"},
+			{"name": "data", "type": "bytes"}
+		],
+		"outputs": [{"name": "", "type": "bool"}]
+	},
+	{
+		"name": "maxFlashLoan",
+		"type": "function",
+		"inputs": [{"name": "token", "type": "address"}],
+		"outputs": [{"name": "", "type": "uint256"}]
+	},
+	{
+		"name": "flashFee",
+		"type": "function",
+		"inputs": [
+			{"name": "token", "type": "address"},
+			{"name": "amount", "type": "uint256"}
+		],
+		"outputs": [{"name": "", "type": "uint256"}]
+	},
+	{
+		"name": "dai",
+		"type": "function",
+		"inputs": [],
+		"outputs": [{"name": "", "type": "address"}]
+	},
+	{
+		"name": "vat",
+		"type": "function",
+		"inputs": [],
+		"outputs": [{"name": "", "type": "address"}]
+	},
+	{
+		"name": "max",
+		"type": "function",
+		"inputs": [],
+		"outputs": [{"name": "", "type": "uint256"}]
+	},
+	{
+		"name": "toll",
+		"type": "function",
+		"inputs": [],
+		"outputs": [{"name": "", "type": "uint256"}]
+	}
+]`
+
+func NewDaiFlashMint(client *ethclient.Client) (*DaiFlashMint, error) {
+	parsedABI, err := abi.JSON(strings.NewReader(DaiFlashMintABI))
+	if err != nil {
+		return nil, err
+	}
+
+	contract := bind.NewBoundContract(DaiFlashMintAddress, parsedABI, client, client, client)
+
+	return &DaiFlashMint{
+		client:    client,
+		flashMint: contract,
+		flashABI:  parsedABI,
+	}, nil
+}
+
+// MaxFlashLoan 获取最大可铸造 DAI 数量
+// 这是一个很大的数字，理论上可以铸造任意数量（受限于合约配置）
+func (d *DaiFlashMint) MaxFlashLoan(ctx context.Context) (*big.Int, error) {
+	var results []interface{}
+	err := d.flashMint.Call(&bind.CallOpts{Context: ctx}, &results, "maxFlashLoan", DaiTokenAddress)
+	if err != nil {
+		return nil, err
+	}
+	return results[0].(*big.Int), nil
+}
+
+// FlashFee 获取闪电铸造费用
+// DAI Flash Mint 费用 = amount * toll / WAD
+// 当前 toll = 0，即免费
+func (d *DaiFlashMint) FlashFee(ctx context.Context, amount *big.Int) (*big.Int, error) {
+	var results []interface{}
+	err := d.flashMint.Call(&bind.CallOpts{Context: ctx}, &results, "flashFee", DaiTokenAddress, amount)
+	if err != nil {
+		return nil, err
+	}
+	return results[0].(*big.Int), nil
+}
+
+// GetToll 获取费率
+func (d *DaiFlashMint) GetToll(ctx context.Context) (*big.Int, error) {
+	var results []interface{}
+	err := d.flashMint.Call(&bind.CallOpts{Context: ctx}, &results, "toll")
+	if err != nil {
+		return nil, err
+	}
+	return results[0].(*big.Int), nil
+}
+
+// DAI Flash Mint 回调合约
+const DaiFlashMintReceiverSolidity = `
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.0;
+
+import {IERC3156FlashBorrower} from "@openzeppelin/contracts/interfaces/IERC3156FlashBorrower.sol";
+import {IERC3156FlashLender} from "@openzeppelin/contracts/interfaces/IERC3156FlashLender.sol";
+import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+
+contract DaiFlashMintReceiver is IERC3156FlashBorrower {
+    bytes32 public constant CALLBACK_SUCCESS = keccak256("ERC3156FlashBorrower.onFlashLoan");
+
+    IERC3156FlashLender public immutable daiFlashMint;
+    address public immutable dai;
+
+    constructor(address _daiFlashMint, address _dai) {
+        daiFlashMint = IERC3156FlashLender(_daiFlashMint);
+        dai = _dai;
+    }
+
+    // EIP-3156 回调
+    function onFlashLoan(
+        address initiator,
+        address token,
+        uint256 amount,
+        uint256 fee,
+        bytes calldata data
+    ) external override returns (bytes32) {
+        require(msg.sender == address(daiFlashMint), "not dai flash mint");
+        require(initiator == address(this), "not this contract");
+        require(token == dai, "not dai");
+
+        // 解码并执行套利
+        (address target, bytes memory payload) = abi.decode(data, (address, bytes));
+
+        // 此时我们有大量 DAI 可用
+        // 可以用于：
+        // 1. 大额清算
+        // 2. 价格操纵套利
+        // 3. 杠杆创建
+        (bool success,) = target.call(payload);
+        require(success, "arbitrage failed");
+
+        // 还款（当前免费，fee = 0）
+        IERC20(dai).approve(address(daiFlashMint), amount + fee);
+
+        return CALLBACK_SUCCESS;
+    }
+
+    // 发起 DAI 闪电铸造
+    function flashMint(
+        uint256 amount,
+        address target,
+        bytes calldata payload
+    ) external {
+        bytes memory data = abi.encode(target, payload);
+        daiFlashMint.flashLoan(
+            IERC3156FlashBorrower(address(this)),
+            dai,
+            amount,
+            data
+        );
+    }
+
+    // 大额清算示例
+    function flashMintLiquidate(
+        uint256 daiAmount,
+        address lendingPool,
+        address collateralAsset,
+        address debtAsset,
+        address user,
+        uint256 debtToCover
+    ) external {
+        // 编码清算参数
+        bytes memory liquidateCall = abi.encodeWithSignature(
+            "liquidationCall(address,address,address,uint256,bool)",
+            collateralAsset,
+            debtAsset,
+            user,
+            debtToCover,
+            false
+        );
+
+        bytes memory data = abi.encode(lendingPool, liquidateCall);
+
+        // 铸造大量 DAI 进行清算
+        daiFlashMint.flashLoan(
+            IERC3156FlashBorrower(address(this)),
+            dai,
+            daiAmount,
+            data
+        );
+    }
+}
+`
+
+// DAI Flash Mint 的独特优势
+type DaiFlashMintAdvantages struct {
+	Feature     string
+	Description string
+}
+
+var DaiFlashMintFeatures = []DaiFlashMintAdvantages{
+	{
+		Feature:     "超大额度",
+		Description: "理论上可以铸造任意数量的 DAI，不受池子流动性限制",
+	},
+	{
+		Feature:     "零费用",
+		Description: "当前 toll = 0，闪电铸造完全免费",
+	},
+	{
+		Feature:     "原生铸造",
+		Description: "直接铸造新 DAI，不是从池子借出，不影响其他用户",
+	},
+	{
+		Feature:     "稳定币优势",
+		Description: "DAI 是稳定币，价格稳定，适合套利计算",
+	},
+	{
+		Feature:     "EIP-3156 兼容",
+		Description: "遵循标准接口，易于集成",
+	},
+}
+```
+
+### A.5 闪电贷协议对比
+
+```go
+// 闪电贷协议综合对比
+package flashloan
+
+import (
+	"math/big"
+)
+
+// FlashLoanProtocol 闪电贷协议特性
+type FlashLoanProtocol struct {
+	Name           string
+	Fee            string      // 费率
+	MaxLoan        string      // 最大借款
+	Assets         []string    // 支持资产
+	Standard       string      // 接口标准
+	GasEstimate    uint64      // Gas 估算
+	Advantages     []string
+	Disadvantages  []string
+}
+
+var FlashLoanProtocols = []FlashLoanProtocol{
+	{
+		Name:        "Aave V3",
+		Fee:         "0.05% (可豁免)",
+		MaxLoan:     "池子可用流动性",
+		Assets:      []string{"ETH", "USDC", "DAI", "WBTC", "等 20+"},
+		Standard:    "自定义",
+		GasEstimate: 250000,
+		Advantages: []string{
+			"资产种类最多",
+			"跨链支持",
+			"机构级安全",
+		},
+		Disadvantages: []string{
+			"费率相对较高",
+			"需要实现特定接口",
+		},
+	},
+	{
+		Name:        "Uniswap V3",
+		Fee:         "池子交易费率 (0.01%-1%)",
+		MaxLoan:     "单个池子流动性",
+		Assets:      []string{"任意 ERC20 对"},
+		Standard:    "自定义",
+		GasEstimate: 200000,
+		Advantages: []string{
+			"支持任意代币对",
+			"可获取任意池子流动性",
+		},
+		Disadvantages: []string{
+			"费率取决于池子",
+			"需要先 swap 再还款",
+		},
+	},
+	{
+		Name:        "Balancer",
+		Fee:         "0% (协议可调)",
+		MaxLoan:     "Vault 总余额",
+		Assets:      []string{"Vault 内所有资产"},
+		Standard:    "自定义",
+		GasEstimate: 180000,
+		Advantages: []string{
+			"零费用",
+			"可借多种资产",
+			"Gas 效率高",
+		},
+		Disadvantages: []string{
+			"资产种类有限",
+		},
+	},
+	{
+		Name:        "Morpho Blue",
+		Fee:         "0%",
+		MaxLoan:     "市场供应量",
+		Assets:      []string{"市场支持资产"},
+		Standard:    "自定义",
+		GasEstimate: 150000,
+		Advantages: []string{
+			"完全免费",
+			"Gas 最低",
+			"简洁接口",
+		},
+		Disadvantages: []string{
+			"相对较新",
+			"资产有限",
+		},
+	},
+	{
+		Name:        "Euler V2",
+		Fee:         "可配置 (默认 0%)",
+		MaxLoan:     "Vault 可用余额",
+		Assets:      []string{"Vault 支持资产"},
+		Standard:    "EIP-3156",
+		GasEstimate: 170000,
+		Advantages: []string{
+			"EIP-3156 标准",
+			"模块化设计",
+			"灵活配置",
+		},
+		Disadvantages: []string{
+			"需要找到对应 Vault",
+		},
+	},
+	{
+		Name:        "dYdX",
+		Fee:         "2 wei",
+		MaxLoan:     "协议流动性",
+		Assets:      []string{"WETH", "USDC", "DAI"},
+		Standard:    "自定义 (operate)",
+		GasEstimate: 300000,
+		Advantages: []string{
+			"几乎免费",
+			"久经考验",
+		},
+		Disadvantages: []string{
+			"接口复杂",
+			"资产有限",
+			"Gas 较高",
+		},
+	},
+	{
+		Name:        "MakerDAO Flash Mint",
+		Fee:         "0% (可调)",
+		MaxLoan:     "理论无限 (配置限制)",
+		Assets:      []string{"DAI"},
+		Standard:    "EIP-3156",
+		GasEstimate: 160000,
+		Advantages: []string{
+			"超大额度",
+			"免费",
+			"标准接口",
+		},
+		Disadvantages: []string{
+			"仅支持 DAI",
+		},
+	},
+}
+
+// FlashLoanSelector 闪电贷选择器
+type FlashLoanSelector struct {
+	protocols map[string]*FlashLoanProtocol
+}
+
+// SelectBestProtocol 根据需求选择最佳协议
+func (s *FlashLoanSelector) SelectBestProtocol(
+	asset string,
+	amount *big.Int,
+	prioritizeFee bool,
+) *FlashLoanProtocol {
+	var candidates []*FlashLoanProtocol
+
+	// 按优先级筛选
+	for _, p := range FlashLoanProtocols {
+		if s.supportsAsset(&p, asset) {
+			candidates = append(candidates, &p)
+		}
+	}
+
+	if len(candidates) == 0 {
+		return nil
+	}
+
+	// 如果优先考虑费用，选择免费的
+	if prioritizeFee {
+		for _, p := range candidates {
+			if p.Fee == "0%" || p.Fee == "2 wei" {
+				return p
+			}
+		}
+	}
+
+	// 返回第一个匹配的
+	return candidates[0]
+}
+
+// 选择策略推荐
+type FlashLoanRecommendation struct {
+	Scenario    string
+	Recommended string
+	Reason      string
+}
+
+var Recommendations = []FlashLoanRecommendation{
+	{
+		Scenario:    "大额 DAI 套利",
+		Recommended: "MakerDAO Flash Mint",
+		Reason:      "无限额度，零费用",
+	},
+	{
+		Scenario:    "多资产闪电贷",
+		Recommended: "Balancer",
+		Reason:      "一次借多种资产，零费用",
+	},
+	{
+		Scenario:    "ETH/主流币套利",
+		Recommended: "Morpho Blue",
+		Reason:      "零费用，Gas 最低",
+	},
+	{
+		Scenario:    "任意代币对套利",
+		Recommended: "Uniswap V3",
+		Reason:      "支持任意池子",
+	},
+	{
+		Scenario:    "需要最大流动性",
+		Recommended: "Aave V3",
+		Reason:      "最大资产池",
+	},
+	{
+		Scenario:    "EIP-3156 兼容需求",
+		Recommended: "Euler V2 / MakerDAO",
+		Reason:      "标准接口",
+	},
+}
+```
+
+### A.6 多协议闪电贷聚合器
+
+```go
+// 多协议闪电贷聚合器
+package flashloan
+
+import (
+	"context"
+	"math/big"
+	"sort"
+
+	"github.com/ethereum/go-ethereum/common"
+	"github.com/ethereum/go-ethereum/ethclient"
+)
+
+// FlashLoanAggregator 闪电贷聚合器
+type FlashLoanAggregator struct {
+	client    *ethclient.Client
+	aave      *AaveFlashLoan
+	morpho    *MorphoFlashLoan
+	euler     *EulerFlashLoan
+	balancer  *BalancerFlashLoan
+	daiMint   *DaiFlashMint
+	dydx      *DYDXFlashLoan
+}
+
+// FlashLoanOption 闪电贷选项
+type FlashLoanOption struct {
+	Protocol    string
+	Asset       common.Address
+	MaxAmount   *big.Int
+	Fee         *big.Int
+	FeePercent  float64
+	GasEstimate uint64
+	Score       float64  // 综合评分
+}
+
+// NewFlashLoanAggregator 创建聚合器
+func NewFlashLoanAggregator(client *ethclient.Client) (*FlashLoanAggregator, error) {
+	agg := &FlashLoanAggregator{client: client}
+
+	var err error
+
+	// 初始化各协议
+	agg.aave, _ = NewAaveFlashLoan(client)
+	agg.morpho, _ = NewMorphoFlashLoan(client)
+	agg.euler, _ = NewEulerFlashLoan(client)
+	agg.daiMint, _ = NewDaiFlashMint(client)
+	agg.dydx, _ = NewDYDXFlashLoan(client)
+
+	return agg, err
+}
+
+// GetBestFlashLoan 获取最佳闪电贷选项
+func (a *FlashLoanAggregator) GetBestFlashLoan(
+	ctx context.Context,
+	asset common.Address,
+	amount *big.Int,
+) (*FlashLoanOption, error) {
+	options, err := a.GetAllOptions(ctx, asset, amount)
+	if err != nil {
+		return nil, err
+	}
+
+	if len(options) == 0 {
+		return nil, fmt.Errorf("no flash loan available for asset")
+	}
+
+	// 按评分排序
+	sort.Slice(options, func(i, j int) bool {
+		return options[i].Score > options[j].Score
+	})
+
+	return options[0], nil
+}
+
+// GetAllOptions 获取所有可用选项
+func (a *FlashLoanAggregator) GetAllOptions(
+	ctx context.Context,
+	asset common.Address,
+	amount *big.Int,
+) ([]*FlashLoanOption, error) {
+	var options []*FlashLoanOption
+
+	// 检查 Morpho Blue
+	if a.morpho != nil {
+		maxAmount, _ := a.morpho.GetAvailableLiquidity(ctx, asset)
+		if maxAmount != nil && maxAmount.Cmp(amount) >= 0 {
+			options = append(options, &FlashLoanOption{
+				Protocol:    "Morpho Blue",
+				Asset:       asset,
+				MaxAmount:   maxAmount,
+				Fee:         big.NewInt(0),
+				FeePercent:  0,
+				GasEstimate: 150000,
+				Score:       calculateScore(0, 150000, maxAmount, amount),
+			})
+		}
+	}
+
+	// 检查 DAI Flash Mint (仅 DAI)
+	if asset == DaiTokenAddress && a.daiMint != nil {
+		maxAmount, _ := a.daiMint.MaxFlashLoan(ctx)
+		fee, _ := a.daiMint.FlashFee(ctx, amount)
+		if maxAmount != nil && maxAmount.Cmp(amount) >= 0 {
+			options = append(options, &FlashLoanOption{
+				Protocol:    "MakerDAO Flash Mint",
+				Asset:       asset,
+				MaxAmount:   maxAmount,
+				Fee:         fee,
+				FeePercent:  0, // 当前免费
+				GasEstimate: 160000,
+				Score:       calculateScore(0, 160000, maxAmount, amount),
+			})
+		}
+	}
+
+	// 检查 Aave
+	if a.aave != nil {
+		maxAmount, _ := a.aave.GetAvailableLiquidity(ctx, asset)
+		if maxAmount != nil && maxAmount.Cmp(amount) >= 0 {
+			// Aave 费率 0.05%
+			feePercent := 0.0005
+			fee := new(big.Int).Div(
+				new(big.Int).Mul(amount, big.NewInt(5)),
+				big.NewInt(10000),
+			)
+			options = append(options, &FlashLoanOption{
+				Protocol:    "Aave V3",
+				Asset:       asset,
+				MaxAmount:   maxAmount,
+				Fee:         fee,
+				FeePercent:  feePercent,
+				GasEstimate: 250000,
+				Score:       calculateScore(feePercent, 250000, maxAmount, amount),
+			})
+		}
+	}
+
+	return options, nil
+}
+
+// calculateScore 计算综合评分
+// 考虑因素：费率、Gas、额度
+func calculateScore(feePercent float64, gas uint64, maxAmount, needAmount *big.Int) float64 {
+	// 基础分 100
+	score := 100.0
+
+	// 费率扣分（每 0.01% 扣 1 分）
+	score -= feePercent * 10000
+
+	// Gas 扣分（每 10000 gas 扣 1 分）
+	score -= float64(gas) / 10000
+
+	// 额度奖励（充足额度加分）
+	if maxAmount.Cmp(needAmount) > 0 {
+		ratio := new(big.Float).Quo(
+			new(big.Float).SetInt(maxAmount),
+			new(big.Float).SetInt(needAmount),
+		)
+		ratioFloat, _ := ratio.Float64()
+		if ratioFloat > 10 {
+			score += 5 // 额度充足奖励
+		}
+	}
+
+	return score
+}
+
+// 聚合器使用示例
+const AggregatorUsageExample = `
+func main() {
+    client, _ := ethclient.Dial("https://eth-mainnet.g.alchemy.com/v2/YOUR_KEY")
+
+    agg, _ := NewFlashLoanAggregator(client)
+
+    // 查找最佳 USDC 闪电贷
+    usdcAddress := common.HexToAddress("0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48")
+    amount := new(big.Int).Mul(big.NewInt(1000000), big.NewInt(1e6)) // 100万 USDC
+
+    best, _ := agg.GetBestFlashLoan(context.Background(), usdcAddress, amount)
+
+    fmt.Printf("最佳协议: %s\n", best.Protocol)
+    fmt.Printf("费用: %s (%.4f%%)\n", best.Fee, best.FeePercent*100)
+    fmt.Printf("Gas 估算: %d\n", best.GasEstimate)
+    fmt.Printf("评分: %.2f\n", best.Score)
+}
+`
+```

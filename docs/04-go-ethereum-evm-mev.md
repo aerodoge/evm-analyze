@@ -1711,6 +1711,953 @@ return true
 
 ---
 
+## 附录 A: PBS (Proposer-Builder Separation) 详解
+
+### A.1 PBS 架构概述
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    PBS 完整架构                                  │
+│                                                                 │
+│  ┌──────────┐    ┌──────────┐    ┌──────────┐    ┌──────────┐  │
+│  │ Searcher │───▶│  Builder │───▶│   Relay  │───▶│ Proposer │  │
+│  └──────────┘    └──────────┘    └──────────┘    └──────────┘  │
+│       │               │               │               │         │
+│       │  Bundles      │  Blocks       │  Bids         │ Signs   │
+│       ▼               ▼               ▼               ▼         │
+│  ┌────────────────────────────────────────────────────────────┐│
+│  │                    执行流程                                  ││
+│  │                                                            ││
+│  │  1. Searchers 提交 Bundles 给 Builders                     ││
+│  │  2. Builders 构建区块并竞标                                 ││
+│  │  3. Relay 验证区块并转发出价                                ││
+│  │  4. Proposer 选择最高出价                                   ││
+│  │  5. Relay 释放区块内容                                      ││
+│  │  6. Proposer 签名并广播                                     ││
+│  │                                                            ││
+│  └────────────────────────────────────────────────────────────┘│
+│                                                                 │
+│  参与者角色:                                                     │
+│  - Searcher: 寻找 MEV 机会，构建交易包                          │
+│  - Builder: 组装完整区块，向 Relay 出价                         │
+│  - Relay: 验证区块，保护区块内容，转发出价                       │
+│  - Proposer: 选择最高出价，签名区块                              │
+│                                                                 │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### A.2 MEV-Boost 客户端实现
+
+```go
+package pbs
+
+import (
+    "bytes"
+    "context"
+    "encoding/json"
+    "fmt"
+    "io"
+    "math/big"
+    "net/http"
+    "sync"
+    "time"
+
+    "github.com/ethereum/go-ethereum/common"
+    "github.com/ethereum/go-ethereum/common/hexutil"
+    "github.com/ethereum/go-ethereum/core/types"
+)
+
+// MEVBoostClient MEV-Boost 客户端
+type MEVBoostClient struct {
+    relays     []*RelayClient
+    httpClient *http.Client
+    mu         sync.RWMutex
+
+    // 配置
+    config *MEVBoostConfig
+}
+
+// MEVBoostConfig 配置
+type MEVBoostConfig struct {
+    Relays           []string
+    RequestTimeout   time.Duration
+    MinBidValue      *big.Int
+    MaxBlockGasLimit uint64
+}
+
+// RelayClient 单个 Relay 客户端
+type RelayClient struct {
+    URL      string
+    Pubkey   string
+    client   *http.Client
+    isActive bool
+}
+
+// BuilderBid Builder 出价
+type BuilderBid struct {
+    Header    *ExecutionPayloadHeader `json:"header"`
+    Value     *big.Int                `json:"value"`
+    Pubkey    string                  `json:"pubkey"`
+    Signature string                  `json:"signature"`
+}
+
+// ExecutionPayloadHeader 执行负载头
+type ExecutionPayloadHeader struct {
+    ParentHash       common.Hash    `json:"parentHash"`
+    FeeRecipient     common.Address `json:"feeRecipient"`
+    StateRoot        common.Hash    `json:"stateRoot"`
+    ReceiptsRoot     common.Hash    `json:"receiptsRoot"`
+    LogsBloom        []byte         `json:"logsBloom"`
+    PrevRandao       common.Hash    `json:"prevRandao"`
+    BlockNumber      uint64         `json:"blockNumber"`
+    GasLimit         uint64         `json:"gasLimit"`
+    GasUsed          uint64         `json:"gasUsed"`
+    Timestamp        uint64         `json:"timestamp"`
+    ExtraData        []byte         `json:"extraData"`
+    BaseFeePerGas    *big.Int       `json:"baseFeePerGas"`
+    BlockHash        common.Hash    `json:"blockHash"`
+    TransactionsRoot common.Hash    `json:"transactionsRoot"`
+}
+
+// SignedBlindedBeaconBlock 签名的盲区块
+type SignedBlindedBeaconBlock struct {
+    Message   *BlindedBeaconBlock `json:"message"`
+    Signature string              `json:"signature"`
+}
+
+// BlindedBeaconBlock 盲区块
+type BlindedBeaconBlock struct {
+    Slot          uint64                  `json:"slot"`
+    ProposerIndex uint64                  `json:"proposer_index"`
+    ParentRoot    common.Hash             `json:"parent_root"`
+    StateRoot     common.Hash             `json:"state_root"`
+    Body          *BlindedBeaconBlockBody `json:"body"`
+}
+
+// BlindedBeaconBlockBody 盲区块体
+type BlindedBeaconBlockBody struct {
+    ExecutionPayloadHeader *ExecutionPayloadHeader `json:"execution_payload_header"`
+}
+
+// NewMEVBoostClient 创建 MEV-Boost 客户端
+func NewMEVBoostClient(config *MEVBoostConfig) *MEVBoostClient {
+    client := &MEVBoostClient{
+        httpClient: &http.Client{
+            Timeout: config.RequestTimeout,
+        },
+        config: config,
+        relays: make([]*RelayClient, 0, len(config.Relays)),
+    }
+
+    for _, relayURL := range config.Relays {
+        client.relays = append(client.relays, &RelayClient{
+            URL:      relayURL,
+            client:   &http.Client{Timeout: config.RequestTimeout},
+            isActive: true,
+        })
+    }
+
+    return client
+}
+
+// RegisterValidator 注册验证者
+func (c *MEVBoostClient) RegisterValidator(ctx context.Context, registration *ValidatorRegistration) error {
+    var wg sync.WaitGroup
+    errors := make(chan error, len(c.relays))
+
+    for _, relay := range c.relays {
+        wg.Add(1)
+        go func(r *RelayClient) {
+            defer wg.Done()
+            err := c.registerWithRelay(ctx, r, registration)
+            if err != nil {
+                errors <- fmt.Errorf("relay %s: %w", r.URL, err)
+            }
+        }(relay)
+    }
+
+    wg.Wait()
+    close(errors)
+
+    // 收集错误
+    var errs []error
+    for err := range errors {
+        errs = append(errs, err)
+    }
+
+    if len(errs) == len(c.relays) {
+        return fmt.Errorf("all relays failed: %v", errs)
+    }
+
+    return nil
+}
+
+// ValidatorRegistration 验证者注册
+type ValidatorRegistration struct {
+    FeeRecipient common.Address `json:"fee_recipient"`
+    GasLimit     uint64         `json:"gas_limit"`
+    Timestamp    uint64         `json:"timestamp"`
+    Pubkey       string         `json:"pubkey"`
+    Signature    string         `json:"signature"`
+}
+
+func (c *MEVBoostClient) registerWithRelay(ctx context.Context, relay *RelayClient, reg *ValidatorRegistration) error {
+    body, err := json.Marshal(reg)
+    if err != nil {
+        return err
+    }
+
+    req, err := http.NewRequestWithContext(ctx, "POST", relay.URL+"/eth/v1/builder/validators", bytes.NewReader(body))
+    if err != nil {
+        return err
+    }
+
+    req.Header.Set("Content-Type", "application/json")
+
+    resp, err := relay.client.Do(req)
+    if err != nil {
+        return err
+    }
+    defer resp.Body.Close()
+
+    if resp.StatusCode != http.StatusOK {
+        body, _ := io.ReadAll(resp.Body)
+        return fmt.Errorf("registration failed: %s", string(body))
+    }
+
+    return nil
+}
+
+// GetHeader 获取区块头 (从所有 Relay 获取最高出价)
+func (c *MEVBoostClient) GetHeader(ctx context.Context, slot uint64, parentHash common.Hash, pubkey string) (*BuilderBid, error) {
+    var wg sync.WaitGroup
+    bids := make(chan *BuilderBid, len(c.relays))
+    errors := make(chan error, len(c.relays))
+
+    for _, relay := range c.relays {
+        if !relay.isActive {
+            continue
+        }
+
+        wg.Add(1)
+        go func(r *RelayClient) {
+            defer wg.Done()
+            bid, err := c.getHeaderFromRelay(ctx, r, slot, parentHash, pubkey)
+            if err != nil {
+                errors <- err
+                return
+            }
+            bids <- bid
+        }(relay)
+    }
+
+    wg.Wait()
+    close(bids)
+    close(errors)
+
+    // 选择最高出价
+    var bestBid *BuilderBid
+    for bid := range bids {
+        if bid == nil {
+            continue
+        }
+        if bestBid == nil || bid.Value.Cmp(bestBid.Value) > 0 {
+            bestBid = bid
+        }
+    }
+
+    if bestBid == nil {
+        return nil, fmt.Errorf("no valid bids received")
+    }
+
+    // 检查最低出价
+    if c.config.MinBidValue != nil && bestBid.Value.Cmp(c.config.MinBidValue) < 0 {
+        return nil, fmt.Errorf("best bid %s below minimum %s", bestBid.Value, c.config.MinBidValue)
+    }
+
+    return bestBid, nil
+}
+
+func (c *MEVBoostClient) getHeaderFromRelay(ctx context.Context, relay *RelayClient, slot uint64, parentHash common.Hash, pubkey string) (*BuilderBid, error) {
+    url := fmt.Sprintf("%s/eth/v1/builder/header/%d/%s/%s", relay.URL, slot, parentHash.Hex(), pubkey)
+
+    req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
+    if err != nil {
+        return nil, err
+    }
+
+    resp, err := relay.client.Do(req)
+    if err != nil {
+        return nil, err
+    }
+    defer resp.Body.Close()
+
+    if resp.StatusCode == http.StatusNoContent {
+        return nil, nil // 无可用出价
+    }
+
+    if resp.StatusCode != http.StatusOK {
+        body, _ := io.ReadAll(resp.Body)
+        return nil, fmt.Errorf("get header failed: %s", string(body))
+    }
+
+    var bid BuilderBid
+    if err := json.NewDecoder(resp.Body).Decode(&bid); err != nil {
+        return nil, err
+    }
+
+    return &bid, nil
+}
+
+// GetPayload 获取完整执行负载
+func (c *MEVBoostClient) GetPayload(ctx context.Context, signedBlock *SignedBlindedBeaconBlock) (*ExecutionPayload, error) {
+    var wg sync.WaitGroup
+    payloads := make(chan *ExecutionPayload, len(c.relays))
+
+    for _, relay := range c.relays {
+        wg.Add(1)
+        go func(r *RelayClient) {
+            defer wg.Done()
+            payload, err := c.getPayloadFromRelay(ctx, r, signedBlock)
+            if err == nil && payload != nil {
+                payloads <- payload
+            }
+        }(relay)
+    }
+
+    wg.Wait()
+    close(payloads)
+
+    // 返回第一个有效负载
+    for payload := range payloads {
+        return payload, nil
+    }
+
+    return nil, fmt.Errorf("no payload received")
+}
+
+// ExecutionPayload 完整执行负载
+type ExecutionPayload struct {
+    ParentHash    common.Hash      `json:"parentHash"`
+    FeeRecipient  common.Address   `json:"feeRecipient"`
+    StateRoot     common.Hash      `json:"stateRoot"`
+    ReceiptsRoot  common.Hash      `json:"receiptsRoot"`
+    LogsBloom     []byte           `json:"logsBloom"`
+    PrevRandao    common.Hash      `json:"prevRandao"`
+    BlockNumber   uint64           `json:"blockNumber"`
+    GasLimit      uint64           `json:"gasLimit"`
+    GasUsed       uint64           `json:"gasUsed"`
+    Timestamp     uint64           `json:"timestamp"`
+    ExtraData     []byte           `json:"extraData"`
+    BaseFeePerGas *big.Int         `json:"baseFeePerGas"`
+    BlockHash     common.Hash      `json:"blockHash"`
+    Transactions  []hexutil.Bytes  `json:"transactions"`
+}
+
+func (c *MEVBoostClient) getPayloadFromRelay(ctx context.Context, relay *RelayClient, signedBlock *SignedBlindedBeaconBlock) (*ExecutionPayload, error) {
+    body, err := json.Marshal(signedBlock)
+    if err != nil {
+        return nil, err
+    }
+
+    req, err := http.NewRequestWithContext(ctx, "POST", relay.URL+"/eth/v1/builder/blinded_blocks", bytes.NewReader(body))
+    if err != nil {
+        return nil, err
+    }
+
+    req.Header.Set("Content-Type", "application/json")
+
+    resp, err := relay.client.Do(req)
+    if err != nil {
+        return nil, err
+    }
+    defer resp.Body.Close()
+
+    if resp.StatusCode != http.StatusOK {
+        body, _ := io.ReadAll(resp.Body)
+        return nil, fmt.Errorf("get payload failed: %s", string(body))
+    }
+
+    var payload ExecutionPayload
+    if err := json.NewDecoder(resp.Body).Decode(&payload); err != nil {
+        return nil, err
+    }
+
+    return &payload, nil
+}
+```
+
+### A.3 Builder 实现
+
+```go
+// BlockBuilder 区块构建器
+type BlockBuilder struct {
+    client       *ethclient.Client
+    relays       []*RelayClient
+    bundlePool   *BundlePool
+    privateKey   *ecdsa.PrivateKey
+    feeRecipient common.Address
+
+    // 构建参数
+    maxGasLimit   uint64
+    extraData     []byte
+}
+
+// BundlePool Bundle 池
+type BundlePool struct {
+    bundles  []*Bundle
+    mu       sync.RWMutex
+    maxSize  int
+}
+
+// Bundle 交易包
+type Bundle struct {
+    Transactions     []*types.Transaction
+    BlockNumber      uint64
+    MinTimestamp     uint64
+    MaxTimestamp     uint64
+    RevertingTxHashes []common.Hash
+    UUID             string
+}
+
+// NewBlockBuilder 创建区块构建器
+func NewBlockBuilder(
+    client *ethclient.Client,
+    privateKey *ecdsa.PrivateKey,
+    feeRecipient common.Address,
+    relays []*RelayClient,
+) *BlockBuilder {
+    return &BlockBuilder{
+        client:       client,
+        privateKey:   privateKey,
+        feeRecipient: feeRecipient,
+        relays:       relays,
+        bundlePool:   NewBundlePool(1000),
+        maxGasLimit:  30000000,
+        extraData:    []byte("MyBuilder"),
+    }
+}
+
+// BuildBlock 构建区块
+func (b *BlockBuilder) BuildBlock(ctx context.Context, slot uint64, parentHash common.Hash) (*BuiltBlock, error) {
+    // 1. 获取 pending 交易
+    pendingTxs, err := b.getPendingTransactions(ctx)
+    if err != nil {
+        return nil, err
+    }
+
+    // 2. 获取待处理的 bundles
+    bundles := b.bundlePool.GetBundlesForBlock(slot)
+
+    // 3. 模拟并排序交易
+    orderedTxs, totalValue := b.orderTransactions(ctx, pendingTxs, bundles, parentHash)
+
+    // 4. 构建区块
+    block := b.assembleBlock(orderedTxs, parentHash, slot)
+
+    return &BuiltBlock{
+        Block:      block,
+        Value:      totalValue,
+        BuilderPubkey: b.getPublicKey(),
+    }, nil
+}
+
+// BuiltBlock 构建的区块
+type BuiltBlock struct {
+    Block         *types.Block
+    Value         *big.Int
+    BuilderPubkey string
+}
+
+// orderTransactions 排序交易以最大化收益
+func (b *BlockBuilder) orderTransactions(
+    ctx context.Context,
+    pendingTxs []*types.Transaction,
+    bundles []*Bundle,
+    parentHash common.Hash,
+) ([]*types.Transaction, *big.Int) {
+    var orderedTxs []*types.Transaction
+    totalValue := big.NewInt(0)
+    usedGas := uint64(0)
+
+    // 1. 首先处理 bundles (按利润排序)
+    sortedBundles := b.sortBundlesByProfit(bundles)
+
+    for _, bundle := range sortedBundles {
+        bundleGas := b.estimateBundleGas(bundle)
+        if usedGas+bundleGas > b.maxGasLimit {
+            continue
+        }
+
+        // 模拟 bundle
+        profit, success := b.simulateBundle(ctx, bundle, parentHash)
+        if !success {
+            continue
+        }
+
+        orderedTxs = append(orderedTxs, bundle.Transactions...)
+        totalValue.Add(totalValue, profit)
+        usedGas += bundleGas
+    }
+
+    // 2. 填充普通交易 (按 gas price 排序)
+    sortedTxs := b.sortByGasPrice(pendingTxs)
+
+    for _, tx := range sortedTxs {
+        if usedGas+tx.Gas() > b.maxGasLimit {
+            continue
+        }
+
+        // 检查是否与现有交易冲突
+        if b.hasConflict(tx, orderedTxs) {
+            continue
+        }
+
+        orderedTxs = append(orderedTxs, tx)
+        usedGas += tx.Gas()
+
+        // 计算 priority fee
+        priorityFee := b.calculatePriorityFee(tx)
+        totalValue.Add(totalValue, priorityFee)
+    }
+
+    return orderedTxs, totalValue
+}
+
+// sortBundlesByProfit 按利润排序 bundles
+func (b *BlockBuilder) sortBundlesByProfit(bundles []*Bundle) []*Bundle {
+    // 使用堆排序或快速排序
+    sorted := make([]*Bundle, len(bundles))
+    copy(sorted, bundles)
+
+    // 按预估利润降序排列
+    for i := 0; i < len(sorted)-1; i++ {
+        for j := i + 1; j < len(sorted); j++ {
+            profitI := b.estimateBundleProfit(sorted[i])
+            profitJ := b.estimateBundleProfit(sorted[j])
+            if profitJ.Cmp(profitI) > 0 {
+                sorted[i], sorted[j] = sorted[j], sorted[i]
+            }
+        }
+    }
+
+    return sorted
+}
+
+// simulateBundle 模拟 bundle 执行
+func (b *BlockBuilder) simulateBundle(ctx context.Context, bundle *Bundle, parentHash common.Hash) (*big.Int, bool) {
+    // 创建状态副本
+    // 依次执行 bundle 中的交易
+    // 计算净利润
+    // 检查是否有交易失败
+
+    profit := big.NewInt(0)
+
+    for _, tx := range bundle.Transactions {
+        // 模拟执行
+        result, err := b.simulateTx(ctx, tx, parentHash)
+        if err != nil {
+            // 检查是否允许回滚
+            isRevertAllowed := false
+            for _, hash := range bundle.RevertingTxHashes {
+                if tx.Hash() == hash {
+                    isRevertAllowed = true
+                    break
+                }
+            }
+            if !isRevertAllowed {
+                return nil, false
+            }
+        }
+
+        // 累加利润
+        if result != nil {
+            profit.Add(profit, result.CoinbaseTransfer)
+        }
+    }
+
+    return profit, true
+}
+
+// SubmitBlock 提交区块到 Relay
+func (b *BlockBuilder) SubmitBlock(ctx context.Context, builtBlock *BuiltBlock, slot uint64) error {
+    // 签名区块
+    signedBid := b.signBid(builtBlock)
+
+    var wg sync.WaitGroup
+    errors := make(chan error, len(b.relays))
+
+    for _, relay := range b.relays {
+        wg.Add(1)
+        go func(r *RelayClient) {
+            defer wg.Done()
+            err := b.submitToRelay(ctx, r, signedBid, slot)
+            if err != nil {
+                errors <- err
+            }
+        }(relay)
+    }
+
+    wg.Wait()
+    close(errors)
+
+    // 至少提交到一个 relay 成功
+    var errs []error
+    for err := range errors {
+        errs = append(errs, err)
+    }
+
+    if len(errs) == len(b.relays) {
+        return fmt.Errorf("failed to submit to all relays")
+    }
+
+    return nil
+}
+
+func (b *BlockBuilder) submitToRelay(ctx context.Context, relay *RelayClient, bid *SignedBuilderBid, slot uint64) error {
+    body, err := json.Marshal(bid)
+    if err != nil {
+        return err
+    }
+
+    req, err := http.NewRequestWithContext(ctx, "POST", relay.URL+"/relay/v1/builder/blocks", bytes.NewReader(body))
+    if err != nil {
+        return err
+    }
+
+    req.Header.Set("Content-Type", "application/json")
+
+    resp, err := relay.client.Do(req)
+    if err != nil {
+        return err
+    }
+    defer resp.Body.Close()
+
+    if resp.StatusCode != http.StatusOK {
+        respBody, _ := io.ReadAll(resp.Body)
+        return fmt.Errorf("submit failed: %s", string(respBody))
+    }
+
+    return nil
+}
+
+// SignedBuilderBid 签名的 Builder 出价
+type SignedBuilderBid struct {
+    Message   *BuilderBid `json:"message"`
+    Signature string      `json:"signature"`
+}
+```
+
+### A.4 Relay 实现
+
+```go
+// Relay MEV Relay 服务
+type Relay struct {
+    db           *RelayDB
+    httpServer   *http.Server
+    validators   map[string]*ValidatorRegistration
+    builders     map[string]*BuilderInfo
+    bids         *BidCache
+    mu           sync.RWMutex
+}
+
+// BidCache 出价缓存
+type BidCache struct {
+    bids map[uint64]map[common.Hash]*BuilderBid // slot -> parentHash -> bid
+    mu   sync.RWMutex
+}
+
+// BuilderInfo Builder 信息
+type BuilderInfo struct {
+    Pubkey    string
+    IsActive  bool
+    HighValue *big.Int // 历史最高出价
+}
+
+// NewRelay 创建 Relay
+func NewRelay(db *RelayDB) *Relay {
+    return &Relay{
+        db:         db,
+        validators: make(map[string]*ValidatorRegistration),
+        builders:   make(map[string]*BuilderInfo),
+        bids:       NewBidCache(),
+    }
+}
+
+// RegisterValidator 注册验证者
+func (r *Relay) RegisterValidator(ctx context.Context, reg *ValidatorRegistration) error {
+    // 1. 验证签名
+    if !r.verifyValidatorSignature(reg) {
+        return fmt.Errorf("invalid signature")
+    }
+
+    // 2. 存储注册信息
+    r.mu.Lock()
+    r.validators[reg.Pubkey] = reg
+    r.mu.Unlock()
+
+    // 3. 持久化
+    return r.db.SaveValidatorRegistration(reg)
+}
+
+// SubmitBlock Builder 提交区块
+func (r *Relay) SubmitBlock(ctx context.Context, bid *SignedBuilderBid, payload *ExecutionPayload) error {
+    // 1. 验证 Builder 签名
+    if !r.verifyBuilderSignature(bid) {
+        return fmt.Errorf("invalid builder signature")
+    }
+
+    // 2. 验证区块有效性
+    if err := r.validateBlock(payload); err != nil {
+        return fmt.Errorf("invalid block: %w", err)
+    }
+
+    // 3. 模拟执行验证
+    if err := r.simulateExecution(ctx, payload); err != nil {
+        return fmt.Errorf("simulation failed: %w", err)
+    }
+
+    // 4. 缓存出价
+    r.bids.Set(bid.Message.Header.BlockNumber, bid.Message.Header.ParentHash, bid.Message)
+
+    // 5. 存储完整负载
+    return r.db.SavePayload(bid.Message.Header.BlockHash, payload)
+}
+
+// GetHeader Proposer 获取最高出价
+func (r *Relay) GetHeader(ctx context.Context, slot uint64, parentHash common.Hash, pubkey string) (*BuilderBid, error) {
+    // 1. 验证请求者是否为该 slot 的 proposer
+    if !r.isValidProposer(slot, pubkey) {
+        return nil, fmt.Errorf("not authorized")
+    }
+
+    // 2. 获取最高出价
+    bid := r.bids.GetBest(slot, parentHash)
+    if bid == nil {
+        return nil, nil
+    }
+
+    return bid, nil
+}
+
+// GetPayload Proposer 获取完整负载
+func (r *Relay) GetPayload(ctx context.Context, signedBlock *SignedBlindedBeaconBlock) (*ExecutionPayload, error) {
+    // 1. 验证签名
+    if !r.verifyProposerSignature(signedBlock) {
+        return nil, fmt.Errorf("invalid proposer signature")
+    }
+
+    // 2. 获取存储的负载
+    blockHash := signedBlock.Message.Body.ExecutionPayloadHeader.BlockHash
+    payload, err := r.db.GetPayload(blockHash)
+    if err != nil {
+        return nil, err
+    }
+
+    // 3. 广播签名的区块
+    go r.broadcastSignedBlock(signedBlock)
+
+    return payload, nil
+}
+
+// validateBlock 验证区块
+func (r *Relay) validateBlock(payload *ExecutionPayload) error {
+    // 检查 gas limit
+    if payload.GasUsed > payload.GasLimit {
+        return fmt.Errorf("gas used exceeds limit")
+    }
+
+    // 检查时间戳
+    if payload.Timestamp < uint64(time.Now().Unix())-12 {
+        return fmt.Errorf("timestamp too old")
+    }
+
+    // 验证交易根
+    txRoot := types.DeriveSha(types.Transactions(r.decodeTxs(payload.Transactions)), new(trie.Trie))
+    if txRoot != payload.TransactionsRoot {
+        return fmt.Errorf("invalid transactions root")
+    }
+
+    return nil
+}
+
+// simulateExecution 模拟执行
+func (r *Relay) simulateExecution(ctx context.Context, payload *ExecutionPayload) error {
+    // 使用 EVM 模拟执行所有交易
+    // 验证 state root
+    // 验证 receipts root
+    // 验证 coinbase 转账
+
+    return nil
+}
+
+func (bc *BidCache) Set(slot uint64, parentHash common.Hash, bid *BuilderBid) {
+    bc.mu.Lock()
+    defer bc.mu.Unlock()
+
+    if bc.bids[slot] == nil {
+        bc.bids[slot] = make(map[common.Hash]*BuilderBid)
+    }
+
+    existing := bc.bids[slot][parentHash]
+    if existing == nil || bid.Value.Cmp(existing.Value) > 0 {
+        bc.bids[slot][parentHash] = bid
+    }
+}
+
+func (bc *BidCache) GetBest(slot uint64, parentHash common.Hash) *BuilderBid {
+    bc.mu.RLock()
+    defer bc.mu.RUnlock()
+
+    if bc.bids[slot] == nil {
+        return nil
+    }
+
+    return bc.bids[slot][parentHash]
+}
+```
+
+### A.5 PBS 时序图
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    PBS 完整时序                                  │
+│                                                                 │
+│  时间轴 (12秒 slot)                                              │
+│  ├────────────────────────────────────────────────────────┤     │
+│  0s                        8s              12s                  │
+│  │                         │                │                   │
+│  │  ┌──────────────────────┐                                   │
+│  │  │ Builder 构建区块阶段   │                                   │
+│  │  │ - 收集 bundles        │                                   │
+│  │  │ - 构建并模拟区块      │                                   │
+│  │  │ - 提交到 Relays       │                                   │
+│  │  └──────────────────────┘                                   │
+│  │                         │                                   │
+│  │                         │  ┌────────────────┐               │
+│  │                         │  │ Proposer 选择   │               │
+│  │                         │  │ - 获取出价      │               │
+│  │                         │  │ - 签名盲区块    │               │
+│  │                         │  │ - 获取负载      │               │
+│  │                         │  │ - 广播区块      │               │
+│  │                         │  └────────────────┘               │
+│  │                         │                │                   │
+│  │                         │                │  下一个 slot      │
+│  │                         │                ▼                   │
+│                                                                 │
+│  关键时间点:                                                     │
+│  - T+0s~8s: Builders 竞争构建区块                               │
+│  - T+8s: Proposer 开始获取出价                                  │
+│  - T+9s: Proposer 选择最高出价并签名                            │
+│  - T+10s: Proposer 获取完整负载                                 │
+│  - T+11s: Proposer 广播区块                                     │
+│  - T+12s: 区块被确认，进入下一个 slot                           │
+│                                                                 │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### A.6 主要 Relay 列表
+
+```go
+// 主流 MEV Relay 列表
+var MainnetRelays = []string{
+    // Flashbots
+    "https://0xac6e77dfe25ecd6110b8e780608cce0dab71fdd5ebea22a16c0205200f2f8e2e3ad3b71d3499c54ad14d6c21b41a37ae@boost-relay.flashbots.net",
+
+    // bloXroute Max Profit
+    "https://0x8b5d2e73e2a3a55c6c87b8b6eb92e0149a125c852751db1422fa951e42a09b82c142c3ea98d0d9930b056a3bc9896b8f@bloxroute.max-profit.blxrbdn.com",
+
+    // bloXroute Ethical
+    "https://0xad0a8bb54565c2211cee576363f3a347089d2f07cf72679d16911d740262694cadb62d7fd7483f27afd714ca0f1b9118@bloxroute.ethical.blxrbdn.com",
+
+    // Ultrasound
+    "https://0xa1559ace749633b997cb3fdacffb890aeebdb0f5a3b6aaa7eeeaf1a38af0a8fe88b9e4b1f61f236d2e64d95733327a62@relay.ultrasound.money",
+
+    // Agnostic
+    "https://0xa7ab7a996c8584251c8f925da3170bdfd6ebc75d50f5ddc4050a6fdc77f2a3b5fce2cc750d0865e05d7228af97d69561@agnostic-relay.net",
+
+    // Aestus
+    "https://0xa15b52576bcbf1072f4a011c0f99f9fb6c66f3e1ff321f11f461d15e31b1cb359caa092c71bbded0bae5b5ea401aab7e@aestus.live",
+}
+
+// RelayStats Relay 统计信息
+type RelayStats struct {
+    Name            string
+    URL             string
+    BlocksProposed  uint64
+    TotalValue      *big.Int
+    AvgBidValue     *big.Int
+    MarketShare     float64
+    Latency         time.Duration
+}
+
+// GetRelayStats 获取 Relay 统计
+func GetRelayStats(ctx context.Context) ([]RelayStats, error) {
+    // 从各 Relay 的 API 获取统计数据
+    // 或从 mevboost.pics 等聚合网站获取
+
+    return nil, nil
+}
+```
+
+### A.7 PBS 安全考虑
+
+```go
+// PBSSecurity PBS 安全检查
+type PBSSecurity struct{}
+
+// 安全风险与缓解措施
+/*
+1. Builder 中心化风险
+   - 风险: 少数 Builder 控制大部分区块
+   - 缓解: 支持多 Relay，Builder 多样性激励
+
+2. Relay 信任风险
+   - 风险: Relay 可能泄露区块内容
+   - 缓解: 使用 Optimistic Relay，验证 Relay 行为
+
+3. Proposer 时序攻击
+   - 风险: Proposer 延迟签名以获取更高出价
+   - 缓解: 时间限制，声誉系统
+
+4. MEV 审查
+   - 风险: Builder/Relay 审查特定交易
+   - 缓解: 加密 mempool (如 Flashbots SUAVE)
+*/
+
+// ValidateRelayBehavior 验证 Relay 行为
+func (s *PBSSecurity) ValidateRelayBehavior(relay *RelayClient) error {
+    // 检查 Relay 是否按规则运行
+    // - 出价是否真实
+    // - 是否按时释放负载
+    // - 是否有审查行为
+
+    return nil
+}
+
+// MonitorBuilderConcentration 监控 Builder 集中度
+func (s *PBSSecurity) MonitorBuilderConcentration(blocks []*types.Block) float64 {
+    builderCounts := make(map[string]int)
+
+    for _, block := range blocks {
+        builder := string(block.Extra())
+        builderCounts[builder]++
+    }
+
+    // 计算 HHI (赫芬达尔指数)
+    total := float64(len(blocks))
+    hhi := 0.0
+    for _, count := range builderCounts {
+        share := float64(count) / total
+        hhi += share * share
+    }
+
+    return hhi
+}
+```
+
+---
+
 ## 总结
 
 本文档详细介绍了 MEV 的核心概念和实战技术：
@@ -1720,5 +2667,6 @@ return true
 3. **Flashbots**：Bundle 机制、提交流程和模拟验证
 4. **MEV-Boost/PBS**：合并后的 MEV 基础设施
 5. **Searcher 开发**：完整的套利机器人架构和优化技巧
+6. **PBS 详解**：Proposer-Builder Separation 的完整架构与实现
 
 下一篇将介绍交易池（TxPool）与交易排序机制。

@@ -2408,6 +2408,861 @@ func (cpv *CrossProtocolValidator) ValidatePrice(
 
 ---
 
+## 附录 A: 推模式预言机详解 (Pyth & RedStone)
+
+### A.1 Pyth Network 深入解析
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    Pyth Network 架构                             │
+│                                                                 │
+│  ┌──────────────┐                                               │
+│  │ 数据发布者    │ (交易所、做市商、DeFi 协议)                    │
+│  │ Publishers   │                                               │
+│  └──────┬───────┘                                               │
+│         │ 签名价格数据                                           │
+│         ▼                                                       │
+│  ┌──────────────┐                                               │
+│  │ Pythnet      │ Solana 侧链，聚合价格                          │
+│  │ (Solana)     │ 计算置信区间                                   │
+│  └──────┬───────┘                                               │
+│         │ Wormhole 跨链                                         │
+│         ▼                                                       │
+│  ┌──────────────┐                                               │
+│  │ Pyth 合约    │ 每条链上的 Pyth 合约                           │
+│  │ (EVM链)     │ 存储和验证价格                                  │
+│  └──────┬───────┘                                               │
+│         │ 拉取模式                                               │
+│         ▼                                                       │
+│  ┌──────────────┐                                               │
+│  │ DeFi 协议    │ 按需请求最新价格                               │
+│  │ 用户合约     │ 支付更新费用                                   │
+│  └──────────────┘                                               │
+│                                                                 │
+│  特点:                                                          │
+│  - 亚秒级更新 (400ms)                                           │
+│  - 置信区间提供价格不确定性                                      │
+│  - 拉取模式节省 gas                                             │
+│  - 支持 350+ 资产                                               │
+│                                                                 │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+```go
+package pyth
+
+import (
+    "context"
+    "encoding/binary"
+    "fmt"
+    "math/big"
+    "time"
+
+    "github.com/ethereum/go-ethereum/accounts/abi"
+    "github.com/ethereum/go-ethereum/accounts/abi/bind"
+    "github.com/ethereum/go-ethereum/common"
+    "github.com/ethereum/go-ethereum/ethclient"
+)
+
+// PythClient Pyth 预言机客户端
+type PythClient struct {
+    client       *ethclient.Client
+    pythContract common.Address
+    hermesURL    string // Pyth Hermes API
+    abi          abi.ABI
+}
+
+// PythPrice Pyth 价格数据
+type PythPrice struct {
+    Price       *big.Int  // 价格 (需要除以 10^expo)
+    Conf        *big.Int  // 置信区间
+    Expo        int32     // 指数
+    PublishTime uint64    // 发布时间
+}
+
+// PriceUpdate 价格更新数据
+type PriceUpdate struct {
+    PriceID     [32]byte
+    Price       PythPrice
+    EMAPrice    PythPrice // 指数移动平均价格
+}
+
+// NewPythClient 创建 Pyth 客户端
+func NewPythClient(client *ethclient.Client, pythContract common.Address, hermesURL string) *PythClient {
+    pythABI, _ := abi.JSON(strings.NewReader(PythABI))
+    return &PythClient{
+        client:       client,
+        pythContract: pythContract,
+        hermesURL:    hermesURL,
+        abi:          pythABI,
+    }
+}
+
+// GetLatestPrice 从 Hermes 获取最新价格更新数据
+func (c *PythClient) GetLatestPrice(ctx context.Context, priceID [32]byte) (*PriceUpdateData, error) {
+    // 1. 从 Hermes API 获取最新价格
+    url := fmt.Sprintf("%s/api/latest_vaas?ids[]=%x", c.hermesURL, priceID)
+
+    req, _ := http.NewRequestWithContext(ctx, "GET", url, nil)
+    resp, err := http.DefaultClient.Do(req)
+    if err != nil {
+        return nil, err
+    }
+    defer resp.Body.Close()
+
+    var result []string
+    if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+        return nil, err
+    }
+
+    if len(result) == 0 {
+        return nil, fmt.Errorf("no price data available")
+    }
+
+    // 解码 VAA (Verified Action Approval)
+    vaaData, _ := base64.StdEncoding.DecodeString(result[0])
+
+    return &PriceUpdateData{
+        Data:    vaaData,
+        PriceID: priceID,
+    }, nil
+}
+
+// PriceUpdateData 价格更新数据
+type PriceUpdateData struct {
+    Data    []byte
+    PriceID [32]byte
+}
+
+// UpdatePriceFeeds 更新链上价格
+func (c *PythClient) UpdatePriceFeeds(ctx context.Context, auth *bind.TransactOpts, updateData [][]byte) (*types.Transaction, error) {
+    // 获取更新费用
+    fee, err := c.getUpdateFee(ctx, updateData)
+    if err != nil {
+        return nil, err
+    }
+
+    // 构建交易数据
+    data, err := c.abi.Pack("updatePriceFeeds", updateData)
+    if err != nil {
+        return nil, err
+    }
+
+    // 发送交易
+    tx := types.NewTransaction(
+        auth.Nonce.Uint64(),
+        c.pythContract,
+        fee,
+        300000,
+        auth.GasPrice,
+        data,
+    )
+
+    signedTx, err := auth.Signer(auth.From, tx)
+    if err != nil {
+        return nil, err
+    }
+
+    return signedTx, c.client.SendTransaction(ctx, signedTx)
+}
+
+// getUpdateFee 获取更新费用
+func (c *PythClient) getUpdateFee(ctx context.Context, updateData [][]byte) (*big.Int, error) {
+    data, err := c.abi.Pack("getUpdateFee", updateData)
+    if err != nil {
+        return nil, err
+    }
+
+    result, err := c.client.CallContract(ctx, ethereum.CallMsg{
+        To:   &c.pythContract,
+        Data: data,
+    }, nil)
+    if err != nil {
+        return nil, err
+    }
+
+    return new(big.Int).SetBytes(result), nil
+}
+
+// GetPrice 获取链上价格
+func (c *PythClient) GetPrice(ctx context.Context, priceID [32]byte) (*PythPrice, error) {
+    data, err := c.abi.Pack("getPrice", priceID)
+    if err != nil {
+        return nil, err
+    }
+
+    result, err := c.client.CallContract(ctx, ethereum.CallMsg{
+        To:   &c.pythContract,
+        Data: data,
+    }, nil)
+    if err != nil {
+        return nil, err
+    }
+
+    // 解码结果
+    return c.decodePrice(result)
+}
+
+// GetPriceNoOlderThan 获取不超过指定时间的价格
+func (c *PythClient) GetPriceNoOlderThan(ctx context.Context, priceID [32]byte, age uint64) (*PythPrice, error) {
+    data, err := c.abi.Pack("getPriceNoOlderThan", priceID, age)
+    if err != nil {
+        return nil, err
+    }
+
+    result, err := c.client.CallContract(ctx, ethereum.CallMsg{
+        To:   &c.pythContract,
+        Data: data,
+    }, nil)
+    if err != nil {
+        return nil, err
+    }
+
+    return c.decodePrice(result)
+}
+
+// GetPriceUnsafe 获取价格 (无时效性检查)
+func (c *PythClient) GetPriceUnsafe(ctx context.Context, priceID [32]byte) (*PythPrice, error) {
+    data, err := c.abi.Pack("getPriceUnsafe", priceID)
+    if err != nil {
+        return nil, err
+    }
+
+    result, err := c.client.CallContract(ctx, ethereum.CallMsg{
+        To:   &c.pythContract,
+        Data: data,
+    }, nil)
+    if err != nil {
+        return nil, err
+    }
+
+    return c.decodePrice(result)
+}
+
+func (c *PythClient) decodePrice(data []byte) (*PythPrice, error) {
+    if len(data) < 128 {
+        return nil, fmt.Errorf("invalid price data")
+    }
+
+    return &PythPrice{
+        Price:       new(big.Int).SetBytes(data[0:32]),
+        Conf:        new(big.Int).SetBytes(data[32:64]),
+        Expo:        int32(binary.BigEndian.Uint32(data[64:68])),
+        PublishTime: binary.BigEndian.Uint64(data[96:104]),
+    }, nil
+}
+
+// ToFloat64 将价格转换为 float64
+func (p *PythPrice) ToFloat64() float64 {
+    priceFloat := new(big.Float).SetInt(p.Price)
+    exp := math.Pow(10, float64(p.Expo))
+    priceFloat.Mul(priceFloat, big.NewFloat(exp))
+    result, _ := priceFloat.Float64()
+    return result
+}
+
+// GetConfidencePercent 获取置信区间百分比
+func (p *PythPrice) GetConfidencePercent() float64 {
+    if p.Price.Sign() == 0 {
+        return 0
+    }
+    conf := new(big.Float).SetInt(p.Conf)
+    price := new(big.Float).SetInt(p.Price)
+    ratio := new(big.Float).Quo(conf, price)
+    result, _ := ratio.Float64()
+    return result * 100
+}
+
+// 常用价格 Feed ID
+var PythPriceFeeds = map[string][32]byte{
+    "ETH/USD":  hexToBytes32("0xff61491a931112ddf1bd8147cd1b641375f79f5825126d665480874634fd0ace"),
+    "BTC/USD":  hexToBytes32("0xe62df6c8b4a85fe1a67db44dc12de5db330f7ac66b72dc658afedf0f4a415b43"),
+    "SOL/USD":  hexToBytes32("0xef0d8b6fda2ceba41da15d4095d1da392a0d2f8ed0c6c7bc0f4cfac8c280b56d"),
+    "USDC/USD": hexToBytes32("0xeaa020c61cc479712813461ce153894a96a6c00b21ed0cfc2798d1f9a9e9c94a"),
+}
+
+func hexToBytes32(hex string) [32]byte {
+    var result [32]byte
+    bytes, _ := hexutil.Decode(hex)
+    copy(result[:], bytes)
+    return result
+}
+```
+
+### A.2 RedStone 预言机
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    RedStone 架构                                 │
+│                                                                 │
+│  独特的"数据打包"(Data Packaging) 模式:                          │
+│                                                                 │
+│  ┌──────────────┐                                               │
+│  │ 数据提供者    │ 签名价格数据                                   │
+│  │ Data Nodes   │ 不直接上链                                     │
+│  └──────┬───────┘                                               │
+│         │ 分发签名数据                                           │
+│         ▼                                                       │
+│  ┌──────────────┐                                               │
+│  │ 数据网关     │ 缓存和分发                                     │
+│  │ Gateways     │ 提供 API 访问                                  │
+│  └──────┬───────┘                                               │
+│         │ 前端/后端获取数据                                       │
+│         ▼                                                       │
+│  ┌──────────────┐                                               │
+│  │ 用户交易     │ 价格数据附加在交易 calldata 中                  │
+│  │ Transaction  │ 无需独立更新交易                               │
+│  └──────┬───────┘                                               │
+│         │ 交易执行时解析                                         │
+│         ▼                                                       │
+│  ┌──────────────┐                                               │
+│  │ DeFi 合约    │ 从 calldata 提取价格                           │
+│  │ + RedStone   │ 验证签名和时效性                               │
+│  └──────────────┘                                               │
+│                                                                 │
+│  优势:                                                          │
+│  - 零额外 gas (价格数据在用户交易中)                             │
+│  - 支持任意代币 (1000+ 资产)                                    │
+│  - 无需预言机更新交易                                           │
+│  - 支持历史价格访问                                              │
+│                                                                 │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+```go
+package redstone
+
+import (
+    "bytes"
+    "context"
+    "crypto/ecdsa"
+    "encoding/binary"
+    "encoding/json"
+    "fmt"
+    "math/big"
+    "net/http"
+    "sort"
+    "time"
+
+    "github.com/ethereum/go-ethereum/common"
+    "github.com/ethereum/go-ethereum/crypto"
+)
+
+// RedStoneClient RedStone 预言机客户端
+type RedStoneClient struct {
+    gatewayURL      string
+    authorizedSigners []common.Address
+    httpClient      *http.Client
+}
+
+// RedStonePrice RedStone 价格数据
+type RedStonePrice struct {
+    Symbol      string
+    Value       *big.Int  // 8 位小数
+    Timestamp   uint64
+    Signature   []byte
+    SignerIndex uint8
+}
+
+// DataPackage 数据包
+type DataPackage struct {
+    Prices        []RedStonePrice
+    Timestamp     uint64
+    DataFeedCount uint8
+}
+
+// NewRedStoneClient 创建 RedStone 客户端
+func NewRedStoneClient(gatewayURL string, authorizedSigners []common.Address) *RedStoneClient {
+    return &RedStoneClient{
+        gatewayURL:      gatewayURL,
+        authorizedSigners: authorizedSigners,
+        httpClient:      &http.Client{Timeout: 10 * time.Second},
+    }
+}
+
+// GetPrices 获取价格数据
+func (c *RedStoneClient) GetPrices(ctx context.Context, symbols []string) (*DataPackage, error) {
+    // 构建请求 URL
+    symbolsParam := ""
+    for i, s := range symbols {
+        if i > 0 {
+            symbolsParam += ","
+        }
+        symbolsParam += s
+    }
+
+    url := fmt.Sprintf("%s/data-packages/latest/%s", c.gatewayURL, symbolsParam)
+
+    req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
+    if err != nil {
+        return nil, err
+    }
+
+    resp, err := c.httpClient.Do(req)
+    if err != nil {
+        return nil, err
+    }
+    defer resp.Body.Close()
+
+    var result map[string][]DataPointResponse
+    if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+        return nil, err
+    }
+
+    // 解析响应
+    return c.parseDataPackages(result, symbols)
+}
+
+// DataPointResponse API 响应
+type DataPointResponse struct {
+    DataFeedId     string `json:"dataFeedId"`
+    Value          string `json:"value"`
+    TimestampMillis int64 `json:"timestampMilliseconds"`
+    Signature      string `json:"signature"`
+    SignerAddress  string `json:"signerAddress"`
+}
+
+func (c *RedStoneClient) parseDataPackages(data map[string][]DataPointResponse, symbols []string) (*DataPackage, error) {
+    pkg := &DataPackage{
+        Prices:        make([]RedStonePrice, 0, len(symbols)),
+        DataFeedCount: uint8(len(symbols)),
+    }
+
+    for _, symbol := range symbols {
+        points, ok := data[symbol]
+        if !ok || len(points) == 0 {
+            return nil, fmt.Errorf("no data for symbol %s", symbol)
+        }
+
+        // 选择最新的数据点
+        point := points[0]
+        for _, p := range points[1:] {
+            if p.TimestampMillis > point.TimestampMillis {
+                point = p
+            }
+        }
+
+        value, _ := new(big.Int).SetString(point.Value, 10)
+        signature, _ := hexutil.Decode(point.Signature)
+
+        // 查找签名者索引
+        signerAddr := common.HexToAddress(point.SignerAddress)
+        signerIndex := uint8(255)
+        for i, addr := range c.authorizedSigners {
+            if addr == signerAddr {
+                signerIndex = uint8(i)
+                break
+            }
+        }
+
+        if signerIndex == 255 {
+            return nil, fmt.Errorf("unauthorized signer: %s", point.SignerAddress)
+        }
+
+        pkg.Prices = append(pkg.Prices, RedStonePrice{
+            Symbol:      symbol,
+            Value:       value,
+            Timestamp:   uint64(point.TimestampMillis / 1000),
+            Signature:   signature,
+            SignerIndex: signerIndex,
+        })
+
+        if pkg.Timestamp == 0 || uint64(point.TimestampMillis/1000) < pkg.Timestamp {
+            pkg.Timestamp = uint64(point.TimestampMillis / 1000)
+        }
+    }
+
+    return pkg, nil
+}
+
+// EncodeDataPackage 编码数据包为 calldata 后缀
+func (c *RedStoneClient) EncodeDataPackage(pkg *DataPackage) []byte {
+    var buf bytes.Buffer
+
+    // RedStone 格式:
+    // 1. 数据点 (每个: 32字节值 + 32字节feedId + 65字节签名)
+    // 2. 时间戳 (6字节)
+    // 3. 数据点数量 (2字节)
+    // 4. 签名者数量 (1字节)
+    // 5. RedStone 标记 (9字节: "RedStone")
+
+    // 按 feedId 排序
+    sort.Slice(pkg.Prices, func(i, j int) bool {
+        return pkg.Prices[i].Symbol < pkg.Prices[j].Symbol
+    })
+
+    for _, price := range pkg.Prices {
+        // 32 字节值 (左填充 0)
+        valueBytes := make([]byte, 32)
+        price.Value.FillBytes(valueBytes)
+        buf.Write(valueBytes)
+
+        // 32 字节 feedId (符号的 keccak256)
+        feedId := crypto.Keccak256([]byte(price.Symbol))
+        buf.Write(feedId)
+
+        // 65 字节签名 (r + s + v)
+        buf.Write(price.Signature)
+    }
+
+    // 6 字节时间戳
+    timestampBytes := make([]byte, 8)
+    binary.BigEndian.PutUint64(timestampBytes, pkg.Timestamp)
+    buf.Write(timestampBytes[2:]) // 取低 6 字节
+
+    // 2 字节数据点数量
+    countBytes := make([]byte, 2)
+    binary.BigEndian.PutUint16(countBytes, uint16(len(pkg.Prices)))
+    buf.Write(countBytes)
+
+    // 1 字节签名者数量
+    buf.WriteByte(1) // 假设单签名者
+
+    // 9 字节 RedStone 标记
+    buf.Write([]byte("RedStone\x00"))
+
+    return buf.Bytes()
+}
+
+// WrapCalldata 将 RedStone 数据附加到交易 calldata
+func (c *RedStoneClient) WrapCalldata(originalCalldata []byte, pkg *DataPackage) []byte {
+    redstoneData := c.EncodeDataPackage(pkg)
+    return append(originalCalldata, redstoneData...)
+}
+
+// VerifySignature 验证签名
+func (c *RedStoneClient) VerifySignature(price *RedStonePrice) bool {
+    // 构建消息哈希
+    message := c.buildSignatureMessage(price)
+    messageHash := crypto.Keccak256Hash(message)
+
+    // 恢复签名者地址
+    pubKey, err := crypto.SigToPub(messageHash.Bytes(), price.Signature)
+    if err != nil {
+        return false
+    }
+
+    recoveredAddr := crypto.PubkeyToAddress(*pubKey)
+
+    // 检查是否为授权签名者
+    for _, addr := range c.authorizedSigners {
+        if addr == recoveredAddr {
+            return true
+        }
+    }
+
+    return false
+}
+
+func (c *RedStoneClient) buildSignatureMessage(price *RedStonePrice) []byte {
+    var buf bytes.Buffer
+
+    // 值
+    valueBytes := make([]byte, 32)
+    price.Value.FillBytes(valueBytes)
+    buf.Write(valueBytes)
+
+    // 时间戳
+    timestampBytes := make([]byte, 8)
+    binary.BigEndian.PutUint64(timestampBytes, price.Timestamp*1000)
+    buf.Write(timestampBytes)
+
+    // Feed ID
+    feedId := crypto.Keccak256([]byte(price.Symbol))
+    buf.Write(feedId)
+
+    return buf.Bytes()
+}
+```
+
+### A.3 RedStone 合约集成
+
+```go
+// RedStoneConsumerBase RedStone 消费者基类 (Go 模拟)
+type RedStoneConsumerBase struct {
+    authorizedSigners []common.Address
+    maxDataAgeSeconds uint64
+}
+
+// ExtractPriceFromCalldata 从 calldata 提取价格
+func (c *RedStoneConsumerBase) ExtractPriceFromCalldata(calldata []byte, symbol string) (*RedStonePrice, error) {
+    // 1. 查找 RedStone 标记
+    markerPos := bytes.LastIndex(calldata, []byte("RedStone\x00"))
+    if markerPos == -1 {
+        return nil, fmt.Errorf("RedStone marker not found")
+    }
+
+    // 2. 解析元数据
+    metadataEnd := markerPos + 9
+    signerCount := calldata[metadataEnd-10]
+    dataPointCount := binary.BigEndian.Uint16(calldata[metadataEnd-12 : metadataEnd-10])
+    timestamp := c.parseTimestamp(calldata[metadataEnd-18 : metadataEnd-12])
+
+    // 3. 检查时效性
+    if uint64(time.Now().Unix())-timestamp > c.maxDataAgeSeconds {
+        return nil, fmt.Errorf("data too old: %d seconds", uint64(time.Now().Unix())-timestamp)
+    }
+
+    // 4. 计算数据点开始位置
+    dataPointSize := 32 + 32 + 65 // value + feedId + signature
+    dataStart := metadataEnd - 18 - int(dataPointCount)*dataPointSize
+
+    // 5. 查找目标符号
+    targetFeedId := crypto.Keccak256([]byte(symbol))
+
+    for i := 0; i < int(dataPointCount); i++ {
+        offset := dataStart + i*dataPointSize
+
+        feedId := calldata[offset+32 : offset+64]
+        if bytes.Equal(feedId, targetFeedId) {
+            value := new(big.Int).SetBytes(calldata[offset : offset+32])
+            signature := calldata[offset+64 : offset+129]
+
+            price := &RedStonePrice{
+                Symbol:    symbol,
+                Value:     value,
+                Timestamp: timestamp,
+                Signature: signature,
+            }
+
+            // 6. 验证签名
+            if !c.verifySignature(price) {
+                return nil, fmt.Errorf("invalid signature")
+            }
+
+            return price, nil
+        }
+    }
+
+    return nil, fmt.Errorf("symbol not found: %s", symbol)
+}
+
+func (c *RedStoneConsumerBase) parseTimestamp(data []byte) uint64 {
+    // 6 字节时间戳
+    var timestamp uint64
+    for _, b := range data {
+        timestamp = (timestamp << 8) | uint64(b)
+    }
+    return timestamp
+}
+
+func (c *RedStoneConsumerBase) verifySignature(price *RedStonePrice) bool {
+    // 构建签名消息
+    var buf bytes.Buffer
+    valueBytes := make([]byte, 32)
+    price.Value.FillBytes(valueBytes)
+    buf.Write(valueBytes)
+
+    timestampBytes := make([]byte, 8)
+    binary.BigEndian.PutUint64(timestampBytes, price.Timestamp*1000)
+    buf.Write(timestampBytes)
+
+    feedId := crypto.Keccak256([]byte(price.Symbol))
+    buf.Write(feedId)
+
+    messageHash := crypto.Keccak256Hash(buf.Bytes())
+
+    // 恢复地址
+    pubKey, err := crypto.SigToPub(messageHash.Bytes(), price.Signature)
+    if err != nil {
+        return false
+    }
+
+    recoveredAddr := crypto.PubkeyToAddress(*pubKey)
+
+    for _, addr := range c.authorizedSigners {
+        if addr == recoveredAddr {
+            return true
+        }
+    }
+
+    return false
+}
+
+// ToFloat64 转换为 float64 (8 位小数)
+func (p *RedStonePrice) ToFloat64() float64 {
+    priceFloat := new(big.Float).SetInt(p.Value)
+    priceFloat.Quo(priceFloat, big.NewFloat(1e8))
+    result, _ := priceFloat.Float64()
+    return result
+}
+```
+
+### A.4 推模式预言机套利策略
+
+```go
+// PullOracleArbitrage 推模式预言机套利
+type PullOracleArbitrage struct {
+    pythClient    *PythClient
+    redstoneClient *RedStoneClient
+    chainlink     *ChainlinkClient
+}
+
+// PriceComparison 价格对比
+type PriceComparison struct {
+    Symbol           string
+    PythPrice        float64
+    PythConf         float64
+    RedStonePrice    float64
+    ChainlinkPrice   float64
+    MaxDiff          float64
+    ArbitrageSignal  bool
+}
+
+// ComparePrices 对比多源价格
+func (a *PullOracleArbitrage) ComparePrices(ctx context.Context, symbol string) (*PriceComparison, error) {
+    comp := &PriceComparison{Symbol: symbol}
+
+    // 并行获取所有价格
+    var wg sync.WaitGroup
+    var mu sync.Mutex
+    errors := make(chan error, 3)
+
+    // Pyth
+    wg.Add(1)
+    go func() {
+        defer wg.Done()
+        priceID := PythPriceFeeds[symbol]
+        price, err := a.pythClient.GetPriceUnsafe(ctx, priceID)
+        if err != nil {
+            errors <- err
+            return
+        }
+        mu.Lock()
+        comp.PythPrice = price.ToFloat64()
+        comp.PythConf = price.GetConfidencePercent()
+        mu.Unlock()
+    }()
+
+    // RedStone
+    wg.Add(1)
+    go func() {
+        defer wg.Done()
+        pkg, err := a.redstoneClient.GetPrices(ctx, []string{symbol})
+        if err != nil {
+            errors <- err
+            return
+        }
+        if len(pkg.Prices) > 0 {
+            mu.Lock()
+            comp.RedStonePrice = pkg.Prices[0].ToFloat64()
+            mu.Unlock()
+        }
+    }()
+
+    // Chainlink
+    wg.Add(1)
+    go func() {
+        defer wg.Done()
+        price, err := a.chainlink.GetLatestPrice(ctx, symbol)
+        if err != nil {
+            errors <- err
+            return
+        }
+        mu.Lock()
+        comp.ChainlinkPrice = price
+        mu.Unlock()
+    }()
+
+    wg.Wait()
+    close(errors)
+
+    // 计算最大差异
+    prices := []float64{comp.PythPrice, comp.RedStonePrice, comp.ChainlinkPrice}
+    var validPrices []float64
+    for _, p := range prices {
+        if p > 0 {
+            validPrices = append(validPrices, p)
+        }
+    }
+
+    if len(validPrices) < 2 {
+        return comp, fmt.Errorf("insufficient price sources")
+    }
+
+    maxPrice := validPrices[0]
+    minPrice := validPrices[0]
+    for _, p := range validPrices[1:] {
+        if p > maxPrice {
+            maxPrice = p
+        }
+        if p < minPrice {
+            minPrice = p
+        }
+    }
+
+    comp.MaxDiff = (maxPrice - minPrice) / minPrice * 100
+
+    // 套利信号: 差异超过 0.5% 且置信区间小于 0.3%
+    comp.ArbitrageSignal = comp.MaxDiff > 0.5 && comp.PythConf < 0.3
+
+    return comp, nil
+}
+
+// ExecuteWithFreshPrice 使用最新价格执行交易
+func (a *PullOracleArbitrage) ExecuteWithFreshPrice(
+    ctx context.Context,
+    auth *bind.TransactOpts,
+    symbols []string,
+    targetContract common.Address,
+    originalCalldata []byte,
+) (*types.Transaction, error) {
+    // 1. 获取最新 Pyth 价格
+    var updateData [][]byte
+    for _, symbol := range symbols {
+        priceID := PythPriceFeeds[symbol]
+        data, err := a.pythClient.GetLatestPrice(ctx, priceID)
+        if err != nil {
+            return nil, err
+        }
+        updateData = append(updateData, data.Data)
+    }
+
+    // 2. 获取 RedStone 价格包
+    pkg, err := a.redstoneClient.GetPrices(ctx, symbols)
+    if err != nil {
+        return nil, err
+    }
+
+    // 3. 选择使用哪个预言机 (基于置信度和费用)
+    pythFee, _ := a.pythClient.getUpdateFee(ctx, updateData)
+
+    // RedStone 无额外费用，但需要在 calldata 中附加数据
+    redstoneData := a.redstoneClient.EncodeDataPackage(pkg)
+
+    // 4. 构建最终交易
+    if pythFee.Cmp(big.NewInt(1e15)) > 0 { // 如果 Pyth 费用超过 0.001 ETH
+        // 使用 RedStone
+        finalCalldata := append(originalCalldata, redstoneData...)
+        return a.sendTransaction(ctx, auth, targetContract, big.NewInt(0), finalCalldata)
+    } else {
+        // 使用 Pyth
+        // 先更新价格
+        _, err := a.pythClient.UpdatePriceFeeds(ctx, auth, updateData)
+        if err != nil {
+            return nil, err
+        }
+        // 再执行原始交易
+        return a.sendTransaction(ctx, auth, targetContract, big.NewInt(0), originalCalldata)
+    }
+}
+```
+
+### A.5 总结
+
+推模式预言机 (Pull Oracle) 的优势和适用场景：
+
+| 特性 | Pyth | RedStone | Chainlink |
+|------|------|----------|-----------|
+| 更新模式 | 拉取 | 打包在 calldata | 推送 |
+| 更新延迟 | ~400ms | 实时 | ~1分钟 |
+| Gas 成本 | 用户支付更新费 | 零额外成本 | 由节点支付 |
+| 资产覆盖 | 350+ | 1000+ | 300+ |
+| 置信区间 | 有 | 无 | 无 |
+| 最佳场景 | 高频交易 | 任意代币支持 | 通用场景 |
+
+---
+
 ## 总结
 
 本文档详细介绍了预言机机制的核心概念和实现：
@@ -2442,5 +3297,10 @@ func (cpv *CrossProtocolValidator) ValidatePrice(
    - 多源聚合
    - 故障转移
    - 跨协议验证
+
+7. **推模式预言机** (附录 A)
+   - Pyth 深入解析
+   - RedStone 数据打包模式
+   - 套利策略实现
 
 预言机是 DeFi 协议的关键基础设施，正确使用和保护预言机对于协议安全至关重要。

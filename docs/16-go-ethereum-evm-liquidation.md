@@ -1484,3 +1484,1333 @@ func (b *LiquidationBot) GetStats() *LiquidationStats {
 2. **Gas 成本**: 高 Gas 环境下利润压缩
 3. **价格波动**: 执行期间价格变化
 4. **流动性**: DEX 滑点影响利润
+
+---
+
+## 附录 A：Aave V3 清算详解
+
+### A.1 Aave V3 清算机制深入
+
+```go
+// Aave V3 清算详细实现
+package liquidation
+
+import (
+	"context"
+	"math/big"
+
+	"github.com/ethereum/go-ethereum/accounts/abi"
+	"github.com/ethereum/go-ethereum/accounts/abi/bind"
+	"github.com/ethereum/go-ethereum/common"
+	"github.com/ethereum/go-ethereum/ethclient"
+)
+
+// Aave V3 合约地址 (Ethereum Mainnet)
+var (
+	AaveV3PoolAddress          = common.HexToAddress("0x87870Bca3F3fD6335C3F4ce8392D69350B4fA4E2")
+	AaveV3PoolDataProviderAddr = common.HexToAddress("0x7B4EB56E7CD4b454BA8ff71E4518426369a138a3")
+	AaveV3OracleAddress        = common.HexToAddress("0x54586bE62E3c3580375aE3723C145253060Ca0C2")
+)
+
+// AaveV3LiquidationClient Aave V3 清算客户端
+type AaveV3LiquidationClient struct {
+	client       *ethclient.Client
+	pool         *bind.BoundContract
+	dataProvider *bind.BoundContract
+	oracle       *bind.BoundContract
+	poolABI      abi.ABI
+}
+
+// Aave V3 Pool ABI (清算相关)
+const AaveV3PoolABI = `[
+	{
+		"name": "liquidationCall",
+		"type": "function",
+		"inputs": [
+			{"name": "collateralAsset", "type": "address"},
+			{"name": "debtAsset", "type": "address"},
+			{"name": "user", "type": "address"},
+			{"name": "debtToCover", "type": "uint256"},
+			{"name": "receiveAToken", "type": "bool"}
+		],
+		"outputs": []
+	},
+	{
+		"name": "getUserAccountData",
+		"type": "function",
+		"inputs": [{"name": "user", "type": "address"}],
+		"outputs": [
+			{"name": "totalCollateralBase", "type": "uint256"},
+			{"name": "totalDebtBase", "type": "uint256"},
+			{"name": "availableBorrowsBase", "type": "uint256"},
+			{"name": "currentLiquidationThreshold", "type": "uint256"},
+			{"name": "ltv", "type": "uint256"},
+			{"name": "healthFactor", "type": "uint256"}
+		]
+	},
+	{
+		"name": "getReserveData",
+		"type": "function",
+		"inputs": [{"name": "asset", "type": "address"}],
+		"outputs": [
+			{"name": "configuration", "type": "uint256"},
+			{"name": "liquidityIndex", "type": "uint128"},
+			{"name": "currentLiquidityRate", "type": "uint128"},
+			{"name": "variableBorrowIndex", "type": "uint128"},
+			{"name": "currentVariableBorrowRate", "type": "uint128"},
+			{"name": "currentStableBorrowRate", "type": "uint128"},
+			{"name": "lastUpdateTimestamp", "type": "uint40"},
+			{"name": "id", "type": "uint16"},
+			{"name": "aTokenAddress", "type": "address"},
+			{"name": "stableDebtTokenAddress", "type": "address"},
+			{"name": "variableDebtTokenAddress", "type": "address"},
+			{"name": "interestRateStrategyAddress", "type": "address"},
+			{"name": "accruedToTreasury", "type": "uint128"},
+			{"name": "unbacked", "type": "uint128"},
+			{"name": "isolationModeTotalDebt", "type": "uint128"}
+		]
+	}
+]`
+
+// AaveV3UserPosition Aave V3 用户仓位
+type AaveV3UserPosition struct {
+	User                     common.Address
+	TotalCollateralBase      *big.Int  // 总抵押品价值 (USD, 8 decimals)
+	TotalDebtBase            *big.Int  // 总债务价值 (USD, 8 decimals)
+	AvailableBorrowsBase     *big.Int  // 可借额度
+	CurrentLiquidationThreshold *big.Int  // 清算阈值 (percentage, 4 decimals)
+	LTV                      *big.Int  // 贷款价值比
+	HealthFactor             *big.Int  // 健康因子 (1e18 = 1.0)
+
+	// 详细仓位
+	CollateralPositions []CollateralPosition
+	DebtPositions       []DebtPosition
+}
+
+// CollateralPosition 抵押品仓位
+type CollateralPosition struct {
+	Asset               common.Address
+	AToken              common.Address
+	Balance             *big.Int  // aToken 余额
+	BalanceBase         *big.Int  // USD 价值
+	LiquidationThreshold *big.Int // 该资产的清算阈值
+	LiquidationBonus    *big.Int  // 清算奖励
+	UsageAsCollateral   bool
+}
+
+// DebtPosition 债务仓位
+type DebtPosition struct {
+	Asset           common.Address
+	VariableDebt    *big.Int
+	StableDebt      *big.Int
+	TotalDebt       *big.Int
+	DebtBase        *big.Int  // USD 价值
+}
+
+func NewAaveV3LiquidationClient(client *ethclient.Client) (*AaveV3LiquidationClient, error) {
+	parsedABI, err := abi.JSON(strings.NewReader(AaveV3PoolABI))
+	if err != nil {
+		return nil, err
+	}
+
+	pool := bind.NewBoundContract(AaveV3PoolAddress, parsedABI, client, client, client)
+
+	return &AaveV3LiquidationClient{
+		client:  client,
+		pool:    pool,
+		poolABI: parsedABI,
+	}, nil
+}
+
+// GetUserPosition 获取用户详细仓位
+func (a *AaveV3LiquidationClient) GetUserPosition(
+	ctx context.Context,
+	user common.Address,
+) (*AaveV3UserPosition, error) {
+	var results []interface{}
+	err := a.pool.Call(&bind.CallOpts{Context: ctx}, &results, "getUserAccountData", user)
+	if err != nil {
+		return nil, err
+	}
+
+	return &AaveV3UserPosition{
+		User:                     user,
+		TotalCollateralBase:      results[0].(*big.Int),
+		TotalDebtBase:            results[1].(*big.Int),
+		AvailableBorrowsBase:     results[2].(*big.Int),
+		CurrentLiquidationThreshold: results[3].(*big.Int),
+		LTV:                      results[4].(*big.Int),
+		HealthFactor:             results[5].(*big.Int),
+	}, nil
+}
+
+// IsLiquidatable 检查是否可清算
+func (a *AaveV3LiquidationClient) IsLiquidatable(position *AaveV3UserPosition) bool {
+	// 健康因子 < 1e18 (1.0) 时可清算
+	return position.HealthFactor.Cmp(big.NewInt(1e18)) < 0 &&
+		position.TotalDebtBase.Sign() > 0
+}
+
+// CalculateLiquidationParams 计算清算参数
+func (a *AaveV3LiquidationClient) CalculateLiquidationParams(
+	ctx context.Context,
+	position *AaveV3UserPosition,
+	collateralAsset common.Address,
+	debtAsset common.Address,
+) (*AaveV3LiquidationParams, error) {
+	// 获取资产配置
+	collateralConfig, err := a.getReserveConfiguration(ctx, collateralAsset)
+	if err != nil {
+		return nil, err
+	}
+
+	// Aave V3 清算规则：
+	// 1. 最多清算 50% 的债务（健康因子 < 0.95 时可清算 100%）
+	// 2. 清算奖励由资产配置决定
+
+	maxLiquidationRatio := big.NewInt(5000) // 50%
+	if position.HealthFactor.Cmp(big.NewInt(95e16)) < 0 { // < 0.95
+		maxLiquidationRatio = big.NewInt(10000) // 100%
+	}
+
+	// 获取用户对该债务资产的债务
+	debtPosition, err := a.getUserDebtForAsset(ctx, position.User, debtAsset)
+	if err != nil {
+		return nil, err
+	}
+
+	// 计算最大可清算债务
+	maxDebtToCover := new(big.Int).Mul(debtPosition.TotalDebt, maxLiquidationRatio)
+	maxDebtToCover.Div(maxDebtToCover, big.NewInt(10000))
+
+	// 获取价格
+	debtPrice, _ := a.getAssetPrice(ctx, debtAsset)
+	collateralPrice, _ := a.getAssetPrice(ctx, collateralAsset)
+
+	// 计算预期获得的抵押品
+	// collateralAmount = debtToCover * debtPrice / collateralPrice * liquidationBonus
+	liquidationBonus := collateralConfig.LiquidationBonus // e.g., 10500 = 105%
+
+	expectedCollateral := new(big.Int).Mul(maxDebtToCover, debtPrice)
+	expectedCollateral.Div(expectedCollateral, collateralPrice)
+	expectedCollateral.Mul(expectedCollateral, liquidationBonus)
+	expectedCollateral.Div(expectedCollateral, big.NewInt(10000))
+
+	// 计算利润 (抵押品价值 - 债务价值)
+	collateralValue := new(big.Int).Mul(expectedCollateral, collateralPrice)
+	debtValue := new(big.Int).Mul(maxDebtToCover, debtPrice)
+	profit := new(big.Int).Sub(collateralValue, debtValue)
+
+	return &AaveV3LiquidationParams{
+		CollateralAsset:     collateralAsset,
+		DebtAsset:           debtAsset,
+		User:                position.User,
+		DebtToCover:         maxDebtToCover,
+		ExpectedCollateral:  expectedCollateral,
+		LiquidationBonus:    liquidationBonus,
+		EstimatedProfit:     profit,
+		ReceiveAToken:       false,
+	}, nil
+}
+
+// AaveV3LiquidationParams 清算参数
+type AaveV3LiquidationParams struct {
+	CollateralAsset     common.Address
+	DebtAsset           common.Address
+	User                common.Address
+	DebtToCover         *big.Int
+	ExpectedCollateral  *big.Int
+	LiquidationBonus    *big.Int
+	EstimatedProfit     *big.Int
+	ReceiveAToken       bool
+}
+
+// ReserveConfiguration 资产配置
+type ReserveConfiguration struct {
+	LTV                  *big.Int
+	LiquidationThreshold *big.Int
+	LiquidationBonus     *big.Int
+	Decimals             uint8
+	Active               bool
+	Frozen               bool
+}
+
+// getReserveConfiguration 获取资产配置
+func (a *AaveV3LiquidationClient) getReserveConfiguration(
+	ctx context.Context,
+	asset common.Address,
+) (*ReserveConfiguration, error) {
+	// 从 configuration bitmap 中解析配置
+	var results []interface{}
+	err := a.pool.Call(&bind.CallOpts{Context: ctx}, &results, "getReserveData", asset)
+	if err != nil {
+		return nil, err
+	}
+
+	configuration := results[0].(*big.Int)
+
+	// 解析 bitmap
+	// Bit 0-15: LTV
+	// Bit 16-31: Liquidation threshold
+	// Bit 32-47: Liquidation bonus
+	// Bit 48-55: Decimals
+	// Bit 56: Reserve is active
+	// Bit 57: Reserve is frozen
+
+	ltv := new(big.Int).And(configuration, big.NewInt(0xFFFF))
+	liqThreshold := new(big.Int).Rsh(configuration, 16)
+	liqThreshold.And(liqThreshold, big.NewInt(0xFFFF))
+	liqBonus := new(big.Int).Rsh(configuration, 32)
+	liqBonus.And(liqBonus, big.NewInt(0xFFFF))
+	decimals := new(big.Int).Rsh(configuration, 48)
+	decimals.And(decimals, big.NewInt(0xFF))
+	active := new(big.Int).Rsh(configuration, 56)
+	active.And(active, big.NewInt(1))
+	frozen := new(big.Int).Rsh(configuration, 57)
+	frozen.And(frozen, big.NewInt(1))
+
+	return &ReserveConfiguration{
+		LTV:                  ltv,
+		LiquidationThreshold: liqThreshold,
+		LiquidationBonus:     liqBonus,
+		Decimals:             uint8(decimals.Uint64()),
+		Active:               active.Cmp(big.NewInt(1)) == 0,
+		Frozen:               frozen.Cmp(big.NewInt(1)) == 0,
+	}, nil
+}
+
+// ExecuteLiquidation 执行清算
+func (a *AaveV3LiquidationClient) ExecuteLiquidation(
+	ctx context.Context,
+	params *AaveV3LiquidationParams,
+	opts *bind.TransactOpts,
+) (common.Hash, error) {
+	tx, err := a.pool.Transact(
+		opts,
+		"liquidationCall",
+		params.CollateralAsset,
+		params.DebtAsset,
+		params.User,
+		params.DebtToCover,
+		params.ReceiveAToken,
+	)
+	if err != nil {
+		return common.Hash{}, err
+	}
+
+	return tx.Hash(), nil
+}
+```
+
+### A.2 Aave V3 清算事件监控
+
+```go
+// Aave V3 清算事件监控
+package liquidation
+
+import (
+	"context"
+	"math/big"
+
+	"github.com/ethereum/go-ethereum"
+	"github.com/ethereum/go-ethereum/common"
+	"github.com/ethereum/go-ethereum/core/types"
+	"github.com/ethereum/go-ethereum/ethclient"
+)
+
+// Aave V3 事件签名
+var (
+	// LiquidationCall(address indexed collateralAsset, address indexed debtAsset,
+	//                 address indexed user, uint256 debtToCover, uint256 liquidatedCollateralAmount,
+	//                 address liquidator, bool receiveAToken)
+	LiquidationCallTopic = common.HexToHash("0xe413a321e8681d831f4dbccbca790d2952b56f977908e45be37335533e005286")
+
+	// ReserveDataUpdated(address indexed reserve, uint256 liquidityRate, uint256 stableBorrowRate,
+	//                    uint256 variableBorrowRate, uint256 liquidityIndex, uint256 variableBorrowIndex)
+	ReserveDataUpdatedTopic = common.HexToHash("0x804c9b842b2748a22bb64b345453a3de7ca54a6ca45ce00d415894979e22897a")
+)
+
+// AaveV3EventMonitor 事件监控器
+type AaveV3EventMonitor struct {
+	client *ethclient.Client
+	pool   common.Address
+}
+
+// LiquidationEvent 清算事件
+type LiquidationEvent struct {
+	BlockNumber         uint64
+	TxHash              common.Hash
+	CollateralAsset     common.Address
+	DebtAsset           common.Address
+	User                common.Address
+	DebtToCover         *big.Int
+	LiquidatedCollateral *big.Int
+	Liquidator          common.Address
+	ReceiveAToken       bool
+}
+
+func NewAaveV3EventMonitor(client *ethclient.Client) *AaveV3EventMonitor {
+	return &AaveV3EventMonitor{
+		client: client,
+		pool:   AaveV3PoolAddress,
+	}
+}
+
+// MonitorLiquidations 监控清算事件
+func (m *AaveV3EventMonitor) MonitorLiquidations(ctx context.Context) (<-chan *LiquidationEvent, error) {
+	query := ethereum.FilterQuery{
+		Addresses: []common.Address{m.pool},
+		Topics:    [][]common.Hash{{LiquidationCallTopic}},
+	}
+
+	logs := make(chan types.Log)
+	sub, err := m.client.SubscribeFilterLogs(ctx, query, logs)
+	if err != nil {
+		return nil, err
+	}
+
+	events := make(chan *LiquidationEvent)
+
+	go func() {
+		defer close(events)
+		defer sub.Unsubscribe()
+
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case err := <-sub.Err():
+				fmt.Printf("订阅错误: %v\n", err)
+				return
+			case log := <-logs:
+				event := m.parseLiquidationEvent(log)
+				if event != nil {
+					events <- event
+				}
+			}
+		}
+	}()
+
+	return events, nil
+}
+
+// parseLiquidationEvent 解析清算事件
+func (m *AaveV3EventMonitor) parseLiquidationEvent(log types.Log) *LiquidationEvent {
+	if len(log.Topics) < 4 {
+		return nil
+	}
+
+	// indexed 参数从 topics 中获取
+	collateralAsset := common.BytesToAddress(log.Topics[1].Bytes())
+	debtAsset := common.BytesToAddress(log.Topics[2].Bytes())
+	user := common.BytesToAddress(log.Topics[3].Bytes())
+
+	// 非 indexed 参数从 data 中获取
+	if len(log.Data) < 128 {
+		return nil
+	}
+
+	debtToCover := new(big.Int).SetBytes(log.Data[0:32])
+	liquidatedCollateral := new(big.Int).SetBytes(log.Data[32:64])
+	liquidator := common.BytesToAddress(log.Data[64:96])
+	receiveAToken := log.Data[127] == 1
+
+	return &LiquidationEvent{
+		BlockNumber:         log.BlockNumber,
+		TxHash:              log.TxHash,
+		CollateralAsset:     collateralAsset,
+		DebtAsset:           debtAsset,
+		User:                user,
+		DebtToCover:         debtToCover,
+		LiquidatedCollateral: liquidatedCollateral,
+		Liquidator:          liquidator,
+		ReceiveAToken:       receiveAToken,
+	}
+}
+
+// AnalyzeLiquidationOpportunity 分析清算机会（监控竞争对手）
+func (m *AaveV3EventMonitor) AnalyzeLiquidationOpportunity(event *LiquidationEvent) *CompetitorAnalysis {
+	// 计算对手获得的利润
+	// 这有助于判断机会的价值
+
+	return &CompetitorAnalysis{
+		Liquidator:           event.Liquidator,
+		CollateralReceived:   event.LiquidatedCollateral,
+		DebtPaid:             event.DebtToCover,
+		BlockNumber:          event.BlockNumber,
+	}
+}
+
+// CompetitorAnalysis 竞争对手分析
+type CompetitorAnalysis struct {
+	Liquidator         common.Address
+	CollateralReceived *big.Int
+	DebtPaid           *big.Int
+	BlockNumber        uint64
+	EstimatedProfit    *big.Int
+}
+```
+
+---
+
+## 附录 B：Morpho Blue 清算
+
+### B.1 Morpho Blue 清算机制
+
+Morpho Blue 采用独立市场模式，每个市场都有独立的清算机制。
+
+```go
+// Morpho Blue 清算客户端
+package liquidation
+
+import (
+	"context"
+	"math/big"
+
+	"github.com/ethereum/go-ethereum/accounts/abi"
+	"github.com/ethereum/go-ethereum/accounts/abi/bind"
+	"github.com/ethereum/go-ethereum/common"
+	"github.com/ethereum/go-ethereum/crypto"
+	"github.com/ethereum/go-ethereum/ethclient"
+)
+
+// Morpho Blue 合约地址
+var (
+	MorphoBlueAddress = common.HexToAddress("0xBBBBBbbBBb9cC5e90e3b3Af64bdAF62C37EEFFCb")
+)
+
+// MorphoBlueLiquidationClient Morpho Blue 清算客户端
+type MorphoBlueLiquidationClient struct {
+	client    *ethclient.Client
+	morpho    *bind.BoundContract
+	morphoABI abi.ABI
+}
+
+// Morpho Blue ABI (清算相关)
+const MorphoBlueABI = `[
+	{
+		"name": "liquidate",
+		"type": "function",
+		"inputs": [
+			{
+				"name": "marketParams",
+				"type": "tuple",
+				"components": [
+					{"name": "loanToken", "type": "address"},
+					{"name": "collateralToken", "type": "address"},
+					{"name": "oracle", "type": "address"},
+					{"name": "irm", "type": "address"},
+					{"name": "lltv", "type": "uint256"}
+				]
+			},
+			{"name": "borrower", "type": "address"},
+			{"name": "seizedAssets", "type": "uint256"},
+			{"name": "repaidShares", "type": "uint256"},
+			{"name": "data", "type": "bytes"}
+		],
+		"outputs": [
+			{"name": "assetsSeized", "type": "uint256"},
+			{"name": "assetsRepaid", "type": "uint256"}
+		]
+	},
+	{
+		"name": "position",
+		"type": "function",
+		"inputs": [
+			{"name": "id", "type": "bytes32"},
+			{"name": "user", "type": "address"}
+		],
+		"outputs": [
+			{"name": "supplyShares", "type": "uint256"},
+			{"name": "borrowShares", "type": "uint128"},
+			{"name": "collateral", "type": "uint128"}
+		]
+	},
+	{
+		"name": "market",
+		"type": "function",
+		"inputs": [{"name": "id", "type": "bytes32"}],
+		"outputs": [
+			{"name": "totalSupplyAssets", "type": "uint128"},
+			{"name": "totalSupplyShares", "type": "uint128"},
+			{"name": "totalBorrowAssets", "type": "uint128"},
+			{"name": "totalBorrowShares", "type": "uint128"},
+			{"name": "lastUpdate", "type": "uint128"},
+			{"name": "fee", "type": "uint128"}
+		]
+	},
+	{
+		"name": "idToMarketParams",
+		"type": "function",
+		"inputs": [{"name": "id", "type": "bytes32"}],
+		"outputs": [
+			{
+				"name": "",
+				"type": "tuple",
+				"components": [
+					{"name": "loanToken", "type": "address"},
+					{"name": "collateralToken", "type": "address"},
+					{"name": "oracle", "type": "address"},
+					{"name": "irm", "type": "address"},
+					{"name": "lltv", "type": "uint256"}
+				]
+			}
+		]
+	}
+]`
+
+// MarketParams Morpho Blue 市场参数
+type MarketParams struct {
+	LoanToken       common.Address
+	CollateralToken common.Address
+	Oracle          common.Address
+	IRM             common.Address  // Interest Rate Model
+	LLTV            *big.Int        // Liquidation LTV (e.g., 90% = 0.9e18)
+}
+
+// MorphoPosition Morpho 仓位
+type MorphoPosition struct {
+	User          common.Address
+	MarketID      [32]byte
+	SupplyShares  *big.Int
+	BorrowShares  *big.Int
+	Collateral    *big.Int
+}
+
+// MorphoMarket Morpho 市场数据
+type MorphoMarket struct {
+	ID                [32]byte
+	Params            *MarketParams
+	TotalSupplyAssets *big.Int
+	TotalSupplyShares *big.Int
+	TotalBorrowAssets *big.Int
+	TotalBorrowShares *big.Int
+	LastUpdate        *big.Int
+	Fee               *big.Int
+}
+
+func NewMorphoBlueLiquidationClient(client *ethclient.Client) (*MorphoBlueLiquidationClient, error) {
+	parsedABI, err := abi.JSON(strings.NewReader(MorphoBlueABI))
+	if err != nil {
+		return nil, err
+	}
+
+	contract := bind.NewBoundContract(MorphoBlueAddress, parsedABI, client, client, client)
+
+	return &MorphoBlueLiquidationClient{
+		client:    client,
+		morpho:    contract,
+		morphoABI: parsedABI,
+	}, nil
+}
+
+// GetMarketID 计算市场 ID
+func GetMarketID(params *MarketParams) [32]byte {
+	// Market ID = keccak256(abi.encode(marketParams))
+	data := common.LeftPadBytes(params.LoanToken.Bytes(), 32)
+	data = append(data, common.LeftPadBytes(params.CollateralToken.Bytes(), 32)...)
+	data = append(data, common.LeftPadBytes(params.Oracle.Bytes(), 32)...)
+	data = append(data, common.LeftPadBytes(params.IRM.Bytes(), 32)...)
+	data = append(data, common.LeftPadBytes(params.LLTV.Bytes(), 32)...)
+
+	hash := crypto.Keccak256(data)
+	var id [32]byte
+	copy(id[:], hash)
+	return id
+}
+
+// GetPosition 获取用户仓位
+func (m *MorphoBlueLiquidationClient) GetPosition(
+	ctx context.Context,
+	marketID [32]byte,
+	user common.Address,
+) (*MorphoPosition, error) {
+	var results []interface{}
+	err := m.morpho.Call(&bind.CallOpts{Context: ctx}, &results, "position", marketID, user)
+	if err != nil {
+		return nil, err
+	}
+
+	return &MorphoPosition{
+		User:         user,
+		MarketID:     marketID,
+		SupplyShares: results[0].(*big.Int),
+		BorrowShares: results[1].(*big.Int),
+		Collateral:   results[2].(*big.Int),
+	}, nil
+}
+
+// GetMarket 获取市场数据
+func (m *MorphoBlueLiquidationClient) GetMarket(
+	ctx context.Context,
+	marketID [32]byte,
+) (*MorphoMarket, error) {
+	var marketResults []interface{}
+	err := m.morpho.Call(&bind.CallOpts{Context: ctx}, &marketResults, "market", marketID)
+	if err != nil {
+		return nil, err
+	}
+
+	var paramsResults []interface{}
+	err = m.morpho.Call(&bind.CallOpts{Context: ctx}, &paramsResults, "idToMarketParams", marketID)
+	if err != nil {
+		return nil, err
+	}
+
+	params := paramsResults[0].(struct {
+		LoanToken       common.Address
+		CollateralToken common.Address
+		Oracle          common.Address
+		Irm             common.Address
+		Lltv            *big.Int
+	})
+
+	return &MorphoMarket{
+		ID: marketID,
+		Params: &MarketParams{
+			LoanToken:       params.LoanToken,
+			CollateralToken: params.CollateralToken,
+			Oracle:          params.Oracle,
+			IRM:             params.Irm,
+			LLTV:            params.Lltv,
+		},
+		TotalSupplyAssets: marketResults[0].(*big.Int),
+		TotalSupplyShares: marketResults[1].(*big.Int),
+		TotalBorrowAssets: marketResults[2].(*big.Int),
+		TotalBorrowShares: marketResults[3].(*big.Int),
+		LastUpdate:        marketResults[4].(*big.Int),
+		Fee:               marketResults[5].(*big.Int),
+	}, nil
+}
+
+// IsLiquidatable 检查是否可清算
+func (m *MorphoBlueLiquidationClient) IsLiquidatable(
+	ctx context.Context,
+	market *MorphoMarket,
+	position *MorphoPosition,
+) (bool, *big.Int, error) {
+	// 获取预言机价格
+	collateralPrice, loanPrice, err := m.getOraclePrices(ctx, market.Params.Oracle)
+	if err != nil {
+		return false, nil, err
+	}
+
+	// 计算借款价值（实际资产而非份额）
+	borrowAssets := m.sharesToAssets(
+		position.BorrowShares,
+		market.TotalBorrowAssets,
+		market.TotalBorrowShares,
+	)
+	borrowValue := new(big.Int).Mul(borrowAssets, loanPrice)
+
+	// 计算抵押品价值
+	collateralValue := new(big.Int).Mul(position.Collateral, collateralPrice)
+
+	// 检查是否超过 LLTV
+	// borrowed * ORACLE_PRICE_SCALE > collateral * collateralPrice * LLTV
+	maxBorrow := new(big.Int).Mul(collateralValue, market.Params.LLTV)
+	maxBorrow.Div(maxBorrow, big.NewInt(1e18))
+
+	isLiquidatable := borrowValue.Cmp(maxBorrow) > 0
+
+	// 计算可清算金额
+	var liquidatableAmount *big.Int
+	if isLiquidatable {
+		// 计算需要清算多少才能恢复健康
+		excess := new(big.Int).Sub(borrowValue, maxBorrow)
+		liquidatableAmount = new(big.Int).Div(excess, loanPrice)
+	}
+
+	return isLiquidatable, liquidatableAmount, nil
+}
+
+// sharesToAssets 份额转资产
+func (m *MorphoBlueLiquidationClient) sharesToAssets(
+	shares, totalAssets, totalShares *big.Int,
+) *big.Int {
+	if totalShares.Sign() == 0 {
+		return big.NewInt(0)
+	}
+	assets := new(big.Int).Mul(shares, totalAssets)
+	assets.Div(assets, totalShares)
+	return assets
+}
+
+// CalculateLiquidationParams 计算清算参数
+func (m *MorphoBlueLiquidationClient) CalculateLiquidationParams(
+	ctx context.Context,
+	market *MorphoMarket,
+	position *MorphoPosition,
+) (*MorphoLiquidationParams, error) {
+	// Morpho Blue 清算特点：
+	// 1. 没有固定清算奖励，使用荷兰拍卖
+	// 2. 清算者可以指定要偿还的债务或要获取的抵押品
+	// 3. 清算比例没有固定上限
+
+	isLiquidatable, liquidatableAmount, err := m.IsLiquidatable(ctx, market, position)
+	if err != nil || !isLiquidatable {
+		return nil, fmt.Errorf("position not liquidatable")
+	}
+
+	// 获取当前价格
+	collateralPrice, loanPrice, _ := m.getOraclePrices(ctx, market.Params.Oracle)
+
+	// 计算最优清算数量
+	// Morpho 使用固定的清算激励因子 (LIF)
+	// LIF = 1 / (1 - LLTV * (1 - liquidationIncentive))
+	// 默认 liquidationIncentive = 5%
+
+	borrowAssets := m.sharesToAssets(
+		position.BorrowShares,
+		market.TotalBorrowAssets,
+		market.TotalBorrowShares,
+	)
+
+	// 计算要扣押的抵押品
+	// seizedCollateral = repaidDebt * loanPrice / collateralPrice * LIF
+	lif := big.NewInt(105e16) // 1.05 (5% incentive)
+	seizedCollateral := new(big.Int).Mul(liquidatableAmount, loanPrice)
+	seizedCollateral.Div(seizedCollateral, collateralPrice)
+	seizedCollateral.Mul(seizedCollateral, lif)
+	seizedCollateral.Div(seizedCollateral, big.NewInt(1e18))
+
+	// 确保不超过用户的抵押品
+	if seizedCollateral.Cmp(position.Collateral) > 0 {
+		seizedCollateral = position.Collateral
+		// 重新计算 repaid
+		liquidatableAmount = new(big.Int).Mul(seizedCollateral, collateralPrice)
+		liquidatableAmount.Mul(liquidatableAmount, big.NewInt(1e18))
+		liquidatableAmount.Div(liquidatableAmount, lif)
+		liquidatableAmount.Div(liquidatableAmount, loanPrice)
+	}
+
+	// 计算利润
+	collateralValue := new(big.Int).Mul(seizedCollateral, collateralPrice)
+	repaidValue := new(big.Int).Mul(liquidatableAmount, loanPrice)
+	profit := new(big.Int).Sub(collateralValue, repaidValue)
+
+	return &MorphoLiquidationParams{
+		MarketParams:       market.Params,
+		Borrower:           position.User,
+		SeizedAssets:       seizedCollateral,
+		RepaidShares:       big.NewInt(0), // 使用 seizedAssets 模式
+		EstimatedProfit:    profit,
+	}, nil
+}
+
+// MorphoLiquidationParams 清算参数
+type MorphoLiquidationParams struct {
+	MarketParams    *MarketParams
+	Borrower        common.Address
+	SeizedAssets    *big.Int  // 要获取的抵押品数量
+	RepaidShares    *big.Int  // 或者要偿还的债务份额
+	EstimatedProfit *big.Int
+}
+
+// ExecuteLiquidation 执行清算
+func (m *MorphoBlueLiquidationClient) ExecuteLiquidation(
+	ctx context.Context,
+	params *MorphoLiquidationParams,
+	opts *bind.TransactOpts,
+) (common.Hash, error) {
+	tx, err := m.morpho.Transact(
+		opts,
+		"liquidate",
+		params.MarketParams,
+		params.Borrower,
+		params.SeizedAssets,
+		params.RepaidShares,
+		[]byte{}, // callback data
+	)
+	if err != nil {
+		return common.Hash{}, err
+	}
+
+	return tx.Hash(), nil
+}
+
+// Morpho Blue 清算回调合约
+const MorphoBlueLiquidationCallbackSolidity = `
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.0;
+
+import {IMorpho, MarketParams} from "@morpho-org/morpho-blue/src/interfaces/IMorpho.sol";
+import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+
+contract MorphoBlueLiquidator {
+    IMorpho public immutable morpho;
+
+    constructor(address _morpho) {
+        morpho = IMorpho(_morpho);
+    }
+
+    // Morpho Blue 清算回调
+    function onMorphoLiquidate(uint256 repaidAssets, bytes calldata data) external {
+        require(msg.sender == address(morpho), "not morpho");
+
+        // 解码参数
+        (address loanToken, address swapTarget, bytes memory swapData) =
+            abi.decode(data, (address, address, bytes));
+
+        // 此时我们已经收到了抵押品
+        // 需要偿还 repaidAssets 的 loanToken
+
+        // 1. 在 DEX 交换抵押品 -> loanToken
+        (bool success,) = swapTarget.call(swapData);
+        require(success, "swap failed");
+
+        // 2. 批准 Morpho 扣取 loanToken
+        IERC20(loanToken).approve(address(morpho), repaidAssets);
+    }
+
+    // 执行清算
+    function liquidate(
+        MarketParams calldata marketParams,
+        address borrower,
+        uint256 seizedAssets,
+        address swapTarget,
+        bytes calldata swapData
+    ) external {
+        bytes memory callbackData = abi.encode(
+            marketParams.loanToken,
+            swapTarget,
+            swapData
+        );
+
+        morpho.liquidate(
+            marketParams,
+            borrower,
+            seizedAssets,
+            0, // repaidShares = 0，使用 seizedAssets 模式
+            callbackData
+        );
+    }
+}
+`
+```
+
+---
+
+## 附录 C：Spark Protocol 清算
+
+### C.1 Spark Protocol 概述
+
+Spark Protocol 是 MakerDAO 的借贷协议，fork 自 Aave V3，但使用 DAI 作为主要借贷资产。
+
+```go
+// Spark Protocol 清算客户端
+package liquidation
+
+import (
+	"context"
+	"math/big"
+
+	"github.com/ethereum/go-ethereum/accounts/abi"
+	"github.com/ethereum/go-ethereum/accounts/abi/bind"
+	"github.com/ethereum/go-ethereum/common"
+	"github.com/ethereum/go-ethereum/ethclient"
+)
+
+// Spark Protocol 合约地址 (Ethereum Mainnet)
+var (
+	SparkPoolAddress         = common.HexToAddress("0xC13e21B648A5Ee794902342038FF3aDAB66BE987")
+	SparkPoolDataProviderAddr = common.HexToAddress("0xFc21d6d146E6086B8359705C8b28512a983db0cb")
+	SparkOracleAddress       = common.HexToAddress("0x8105f69D9C41644c6A0803fDA7D03Aa70996cFD9")
+)
+
+// SparkLiquidationClient Spark Protocol 清算客户端
+type SparkLiquidationClient struct {
+	client   *ethclient.Client
+	pool     *bind.BoundContract
+	poolABI  abi.ABI
+}
+
+// Spark Protocol 与 Aave V3 接口相同
+const SparkPoolABI = `[
+	{
+		"name": "liquidationCall",
+		"type": "function",
+		"inputs": [
+			{"name": "collateralAsset", "type": "address"},
+			{"name": "debtAsset", "type": "address"},
+			{"name": "user", "type": "address"},
+			{"name": "debtToCover", "type": "uint256"},
+			{"name": "receiveAToken", "type": "bool"}
+		],
+		"outputs": []
+	},
+	{
+		"name": "getUserAccountData",
+		"type": "function",
+		"inputs": [{"name": "user", "type": "address"}],
+		"outputs": [
+			{"name": "totalCollateralBase", "type": "uint256"},
+			{"name": "totalDebtBase", "type": "uint256"},
+			{"name": "availableBorrowsBase", "type": "uint256"},
+			{"name": "currentLiquidationThreshold", "type": "uint256"},
+			{"name": "ltv", "type": "uint256"},
+			{"name": "healthFactor", "type": "uint256"}
+		]
+	}
+]`
+
+// Spark 特有资产
+var (
+	SparkDAI   = common.HexToAddress("0x6B175474E89094C44Da98b954EescdeCB5c3cD")
+	SparkSDAI  = common.HexToAddress("0x83F20F44975D03b1b09e64809B757c47f942BEeA") // Savings DAI
+	SparkWETH  = common.HexToAddress("0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2")
+	SparkWSTETH = common.HexToAddress("0x7f39C581F595B53c5cb19bD0b3f8dA6c935E2Ca0")
+	SparkRETH   = common.HexToAddress("0xae78736Cd615f374D3085123A210448E74Fc6393")
+)
+
+func NewSparkLiquidationClient(client *ethclient.Client) (*SparkLiquidationClient, error) {
+	parsedABI, err := abi.JSON(strings.NewReader(SparkPoolABI))
+	if err != nil {
+		return nil, err
+	}
+
+	pool := bind.NewBoundContract(SparkPoolAddress, parsedABI, client, client, client)
+
+	return &SparkLiquidationClient{
+		client:  client,
+		pool:    pool,
+		poolABI: parsedABI,
+	}, nil
+}
+
+// GetUserPosition 获取用户仓位（与 Aave V3 相同）
+func (s *SparkLiquidationClient) GetUserPosition(
+	ctx context.Context,
+	user common.Address,
+) (*SparkUserPosition, error) {
+	var results []interface{}
+	err := s.pool.Call(&bind.CallOpts{Context: ctx}, &results, "getUserAccountData", user)
+	if err != nil {
+		return nil, err
+	}
+
+	return &SparkUserPosition{
+		User:                     user,
+		TotalCollateralBase:      results[0].(*big.Int),
+		TotalDebtBase:            results[1].(*big.Int),
+		AvailableBorrowsBase:     results[2].(*big.Int),
+		CurrentLiquidationThreshold: results[3].(*big.Int),
+		LTV:                      results[4].(*big.Int),
+		HealthFactor:             results[5].(*big.Int),
+	}, nil
+}
+
+// SparkUserPosition Spark 用户仓位
+type SparkUserPosition struct {
+	User                     common.Address
+	TotalCollateralBase      *big.Int
+	TotalDebtBase            *big.Int
+	AvailableBorrowsBase     *big.Int
+	CurrentLiquidationThreshold *big.Int
+	LTV                      *big.Int
+	HealthFactor             *big.Int
+}
+
+// Spark Protocol 特有的清算策略
+// 由于 Spark 主要使用 DAI，可以结合 MakerDAO Flash Mint
+
+// SparkLiquidationParams 清算参数
+type SparkLiquidationParams struct {
+	CollateralAsset  common.Address
+	DebtAsset        common.Address
+	User             common.Address
+	DebtToCover      *big.Int
+	ReceiveAToken    bool
+	UseDAIFlashMint  bool  // 是否使用 DAI Flash Mint
+}
+
+// ExecuteLiquidationWithDAIFlashMint 使用 DAI Flash Mint 执行清算
+func (s *SparkLiquidationClient) ExecuteLiquidationWithDAIFlashMint(
+	ctx context.Context,
+	params *SparkLiquidationParams,
+) (common.Hash, error) {
+	// 如果债务是 DAI，可以使用 MakerDAO Flash Mint
+	// 优势：超大额度，零费用
+
+	// 实际实现需要部署清算合约
+	return common.Hash{}, nil
+}
+
+// Spark + DAI Flash Mint 清算合约
+const SparkDAIFlashMintLiquidatorSolidity = `
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.0;
+
+import {IERC3156FlashBorrower} from "@openzeppelin/contracts/interfaces/IERC3156FlashBorrower.sol";
+import {IERC3156FlashLender} from "@openzeppelin/contracts/interfaces/IERC3156FlashLender.sol";
+import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+
+interface ISparkPool {
+    function liquidationCall(
+        address collateralAsset,
+        address debtAsset,
+        address user,
+        uint256 debtToCover,
+        bool receiveAToken
+    ) external returns (uint256, uint256);
+}
+
+contract SparkDAIFlashMintLiquidator is IERC3156FlashBorrower {
+    bytes32 public constant CALLBACK_SUCCESS = keccak256("ERC3156FlashBorrower.onFlashLoan");
+
+    IERC3156FlashLender public immutable daiFlashMint;
+    ISparkPool public immutable sparkPool;
+    address public immutable dai;
+
+    constructor(
+        address _daiFlashMint,
+        address _sparkPool,
+        address _dai
+    ) {
+        daiFlashMint = IERC3156FlashLender(_daiFlashMint);
+        sparkPool = ISparkPool(_sparkPool);
+        dai = _dai;
+    }
+
+    // DAI Flash Mint 回调
+    function onFlashLoan(
+        address initiator,
+        address token,
+        uint256 amount,
+        uint256 fee,
+        bytes calldata data
+    ) external override returns (bytes32) {
+        require(msg.sender == address(daiFlashMint), "not flash mint");
+        require(initiator == address(this), "not this contract");
+        require(token == dai, "not dai");
+
+        // 解码清算参数
+        (
+            address collateralAsset,
+            address user,
+            uint256 debtToCover,
+            address swapTarget,
+            bytes memory swapData
+        ) = abi.decode(data, (address, address, uint256, address, bytes));
+
+        // 1. 批准 Spark Pool 使用 DAI
+        IERC20(dai).approve(address(sparkPool), debtToCover);
+
+        // 2. 执行清算
+        sparkPool.liquidationCall(
+            collateralAsset,
+            dai,  // Spark 主要债务是 DAI
+            user,
+            debtToCover,
+            false
+        );
+
+        // 3. 收到抵押品，在 DEX 换回 DAI
+        if (swapTarget != address(0)) {
+            (bool success,) = swapTarget.call(swapData);
+            require(success, "swap failed");
+        }
+
+        // 4. 批准还款 (fee = 0 for DAI Flash Mint)
+        IERC20(dai).approve(address(daiFlashMint), amount + fee);
+
+        return CALLBACK_SUCCESS;
+    }
+
+    // 执行清算
+    function liquidate(
+        address collateralAsset,
+        address user,
+        uint256 debtToCover,
+        address swapTarget,
+        bytes calldata swapData
+    ) external {
+        bytes memory data = abi.encode(
+            collateralAsset,
+            user,
+            debtToCover,
+            swapTarget,
+            swapData
+        );
+
+        daiFlashMint.flashLoan(
+            IERC3156FlashBorrower(address(this)),
+            dai,
+            debtToCover,
+            data
+        );
+    }
+}
+`
+```
+
+### C.2 多协议清算聚合器
+
+```go
+// 多协议清算聚合器
+package liquidation
+
+import (
+	"context"
+	"math/big"
+	"sync"
+
+	"github.com/ethereum/go-ethereum/common"
+	"github.com/ethereum/go-ethereum/ethclient"
+)
+
+// MultiProtocolLiquidator 多协议清算器
+type MultiProtocolLiquidator struct {
+	client *ethclient.Client
+
+	aaveV3    *AaveV3LiquidationClient
+	morpho    *MorphoBlueLiquidationClient
+	spark     *SparkLiquidationClient
+
+	// 配置
+	minProfit       *big.Int
+	maxGasPrice     *big.Int
+}
+
+func NewMultiProtocolLiquidator(client *ethclient.Client) (*MultiProtocolLiquidator, error) {
+	aaveV3, _ := NewAaveV3LiquidationClient(client)
+	morpho, _ := NewMorphoBlueLiquidationClient(client)
+	spark, _ := NewSparkLiquidationClient(client)
+
+	return &MultiProtocolLiquidator{
+		client:      client,
+		aaveV3:      aaveV3,
+		morpho:      morpho,
+		spark:       spark,
+		minProfit:   big.NewInt(1e16), // 0.01 ETH
+		maxGasPrice: big.NewInt(100e9), // 100 Gwei
+	}, nil
+}
+
+// UnifiedPosition 统一仓位格式
+type UnifiedPosition struct {
+	Protocol        string
+	User            common.Address
+	HealthFactor    *big.Int
+	TotalCollateral *big.Int
+	TotalDebt       *big.Int
+	IsLiquidatable  bool
+}
+
+// ScanAllProtocols 扫描所有协议
+func (m *MultiProtocolLiquidator) ScanAllProtocols(
+	ctx context.Context,
+	users []common.Address,
+) ([]*UnifiedPosition, error) {
+	var positions []*UnifiedPosition
+	var mu sync.Mutex
+	var wg sync.WaitGroup
+
+	for _, user := range users {
+		wg.Add(3)
+
+		// Aave V3
+		go func(u common.Address) {
+			defer wg.Done()
+			pos, _ := m.aaveV3.GetUserPosition(ctx, u)
+			if pos != nil && pos.HealthFactor.Cmp(big.NewInt(1e18)) < 0 {
+				mu.Lock()
+				positions = append(positions, &UnifiedPosition{
+					Protocol:        "AaveV3",
+					User:            u,
+					HealthFactor:    pos.HealthFactor,
+					TotalCollateral: pos.TotalCollateralBase,
+					TotalDebt:       pos.TotalDebtBase,
+					IsLiquidatable:  true,
+				})
+				mu.Unlock()
+			}
+		}(user)
+
+		// Spark
+		go func(u common.Address) {
+			defer wg.Done()
+			pos, _ := m.spark.GetUserPosition(ctx, u)
+			if pos != nil && pos.HealthFactor.Cmp(big.NewInt(1e18)) < 0 {
+				mu.Lock()
+				positions = append(positions, &UnifiedPosition{
+					Protocol:        "Spark",
+					User:            u,
+					HealthFactor:    pos.HealthFactor,
+					TotalCollateral: pos.TotalCollateralBase,
+					TotalDebt:       pos.TotalDebtBase,
+					IsLiquidatable:  true,
+				})
+				mu.Unlock()
+			}
+		}(user)
+
+		// Morpho (需要指定市场)
+		go func(u common.Address) {
+			defer wg.Done()
+			// Morpho 需要遍历所有市场
+		}(user)
+	}
+
+	wg.Wait()
+	return positions, nil
+}
+
+// ExecuteBestLiquidation 执行最佳清算
+func (m *MultiProtocolLiquidator) ExecuteBestLiquidation(
+	ctx context.Context,
+	position *UnifiedPosition,
+) error {
+	switch position.Protocol {
+	case "AaveV3":
+		// 使用 Aave 清算
+		return m.executeAaveV3Liquidation(ctx, position)
+	case "Spark":
+		// 使用 Spark + DAI Flash Mint
+		return m.executeSparkLiquidation(ctx, position)
+	case "Morpho":
+		// 使用 Morpho 清算
+		return m.executeMorphoLiquidation(ctx, position)
+	default:
+		return fmt.Errorf("unknown protocol: %s", position.Protocol)
+	}
+}
+
+// 清算协议对比
+var LiquidationProtocolComparison = []struct {
+	Protocol        string
+	LiquidationBonus string
+	MaxLiquidation  string
+	FlashLoan       string
+	GasEstimate     string
+}{
+	{
+		Protocol:        "Aave V3",
+		LiquidationBonus: "5-10%",
+		MaxLiquidation:  "50% (100% if HF < 0.95)",
+		FlashLoan:       "Aave Flash Loan (0.05%)",
+		GasEstimate:     "~300,000",
+	},
+	{
+		Protocol:        "Morpho Blue",
+		LiquidationBonus: "~5% (LIF)",
+		MaxLiquidation:  "100%",
+		FlashLoan:       "Morpho Flash Loan (0%)",
+		GasEstimate:     "~200,000",
+	},
+	{
+		Protocol:        "Spark",
+		LiquidationBonus: "5-10%",
+		MaxLiquidation:  "50% (100% if HF < 0.95)",
+		FlashLoan:       "DAI Flash Mint (0%)",
+		GasEstimate:     "~300,000",
+	},
+	{
+		Protocol:        "Compound V3",
+		LiquidationBonus: "5% discount",
+		MaxLiquidation:  "100% (absorb)",
+		FlashLoan:       "Balancer (0%)",
+		GasEstimate:     "~250,000",
+	},
+}
+```

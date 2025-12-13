@@ -1500,3 +1500,1198 @@ func weiToEth(wei *big.Int) string {
 7. **实战引擎**：完整的模拟引擎实现
 
 下一篇将介绍 L2 EVM 变体（Arbitrum、Optimism 等）。
+
+---
+
+## 附录 A：Tenderly 模拟 API 集成
+
+### A.1 Tenderly 概述
+
+Tenderly 提供强大的交易模拟和调试功能，适用于生产环境的交易测试。
+
+```go
+// Tenderly 模拟客户端
+package simulation
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"fmt"
+	"math/big"
+	"net/http"
+
+	"github.com/ethereum/go-ethereum/common"
+)
+
+// TenderlyClient Tenderly API 客户端
+type TenderlyClient struct {
+	apiKey      string
+	accountSlug string
+	projectSlug string
+	httpClient  *http.Client
+	baseURL     string
+}
+
+// TenderlyConfig 配置
+type TenderlyConfig struct {
+	APIKey      string
+	AccountSlug string
+	ProjectSlug string
+}
+
+func NewTenderlyClient(config TenderlyConfig) *TenderlyClient {
+	return &TenderlyClient{
+		apiKey:      config.APIKey,
+		accountSlug: config.AccountSlug,
+		projectSlug: config.ProjectSlug,
+		httpClient:  &http.Client{},
+		baseURL:     "https://api.tenderly.co/api/v1",
+	}
+}
+
+// SimulationRequest 模拟请求
+type SimulationRequest struct {
+	NetworkID         string               `json:"network_id"`
+	BlockNumber       int64                `json:"block_number,omitempty"`
+	TransactionIndex  int                  `json:"transaction_index,omitempty"`
+	From              string               `json:"from"`
+	To                string               `json:"to"`
+	Input             string               `json:"input"`
+	Gas               uint64               `json:"gas"`
+	GasPrice          string               `json:"gas_price,omitempty"`
+	Value             string               `json:"value,omitempty"`
+	SaveSimulation    bool                 `json:"save_simulation,omitempty"`
+	Save              bool                 `json:"save,omitempty"`
+	SimulationType    string               `json:"simulation_type,omitempty"` // "quick" or "full"
+	StateObjects      map[string]StateObj  `json:"state_objects,omitempty"`
+}
+
+// StateObj 状态覆盖对象
+type StateObj struct {
+	Balance string                     `json:"balance,omitempty"`
+	Code    string                     `json:"code,omitempty"`
+	Storage map[string]string          `json:"storage,omitempty"`
+}
+
+// SimulationResponse 模拟响应
+type SimulationResponse struct {
+	Transaction TransactionInfo `json:"transaction"`
+	Simulation  SimulationInfo  `json:"simulation"`
+}
+
+// TransactionInfo 交易信息
+type TransactionInfo struct {
+	Hash              string        `json:"hash"`
+	Status            bool          `json:"status"`
+	GasUsed           uint64        `json:"gas_used"`
+	CumulativeGasUsed uint64        `json:"cumulative_gas_used"`
+	BlockNumber       uint64        `json:"block_number"`
+	TransactionInfo   TxInfoDetail  `json:"transaction_info"`
+}
+
+// TxInfoDetail 交易详情
+type TxInfoDetail struct {
+	Logs          []LogEntry        `json:"logs"`
+	AssetChanges  []AssetChange     `json:"asset_changes"`
+	BalanceDiff   []BalanceDiff     `json:"balance_diff"`
+	StorageChanges []StorageChange  `json:"storage_changes"`
+	CallTrace     *CallTrace        `json:"call_trace"`
+}
+
+// SimulationInfo 模拟信息
+type SimulationInfo struct {
+	ID            string `json:"id"`
+	ProjectID     string `json:"project_id"`
+	CreatedAt     string `json:"created_at"`
+}
+
+// LogEntry 日志条目
+type LogEntry struct {
+	Address string   `json:"address"`
+	Topics  []string `json:"topics"`
+	Data    string   `json:"data"`
+	Name    string   `json:"name"`
+}
+
+// AssetChange 资产变化
+type AssetChange struct {
+	TokenInfo    TokenInfo `json:"token_info"`
+	Type         string    `json:"type"` // "Transfer", "Mint", "Burn"
+	From         string    `json:"from"`
+	To           string    `json:"to"`
+	Amount       string    `json:"amount"`
+	RawAmount    string    `json:"raw_amount"`
+}
+
+// TokenInfo 代币信息
+type TokenInfo struct {
+	Standard  string `json:"standard"` // "ERC20", "ERC721", "Native"
+	Type      string `json:"type"`
+	Symbol    string `json:"symbol"`
+	Name      string `json:"name"`
+	Decimals  int    `json:"decimals"`
+	Address   string `json:"contract_address"`
+}
+
+// CallTrace 调用追踪
+type CallTrace struct {
+	Hash            string      `json:"hash"`
+	From            string      `json:"from"`
+	To              string      `json:"to"`
+	Value           string      `json:"value"`
+	Gas             uint64      `json:"gas"`
+	GasUsed         uint64      `json:"gas_used"`
+	Input           string      `json:"input"`
+	Output          string      `json:"output"`
+	Type            string      `json:"type"` // "CALL", "STATICCALL", "DELEGATECALL"
+	DecodedInput    *DecodedData `json:"decoded_input"`
+	DecodedOutput   *DecodedData `json:"decoded_output"`
+	Calls           []*CallTrace `json:"calls"`
+	Error           string      `json:"error,omitempty"`
+}
+
+// DecodedData 解码数据
+type DecodedData struct {
+	MethodName string                 `json:"method_name"`
+	Parameters map[string]interface{} `json:"parameters"`
+}
+
+// Simulate 执行模拟
+func (c *TenderlyClient) Simulate(ctx context.Context, req *SimulationRequest) (*SimulationResponse, error) {
+	url := fmt.Sprintf("%s/account/%s/project/%s/simulate",
+		c.baseURL, c.accountSlug, c.projectSlug)
+
+	body, err := json.Marshal(req)
+	if err != nil {
+		return nil, err
+	}
+
+	httpReq, err := http.NewRequestWithContext(ctx, "POST", url, bytes.NewReader(body))
+	if err != nil {
+		return nil, err
+	}
+
+	httpReq.Header.Set("Content-Type", "application/json")
+	httpReq.Header.Set("X-Access-Key", c.apiKey)
+
+	resp, err := c.httpClient.Do(httpReq)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("tenderly api error: %d", resp.StatusCode)
+	}
+
+	var result SimulationResponse
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return nil, err
+	}
+
+	return &result, nil
+}
+
+// SimulateBundle 模拟交易 Bundle
+func (c *TenderlyClient) SimulateBundle(
+	ctx context.Context,
+	txs []*SimulationRequest,
+) ([]*SimulationResponse, error) {
+	url := fmt.Sprintf("%s/account/%s/project/%s/simulate-bundle",
+		c.baseURL, c.accountSlug, c.projectSlug)
+
+	bundleReq := struct {
+		Simulations []*SimulationRequest `json:"simulations"`
+	}{
+		Simulations: txs,
+	}
+
+	body, err := json.Marshal(bundleReq)
+	if err != nil {
+		return nil, err
+	}
+
+	httpReq, err := http.NewRequestWithContext(ctx, "POST", url, bytes.NewReader(body))
+	if err != nil {
+		return nil, err
+	}
+
+	httpReq.Header.Set("Content-Type", "application/json")
+	httpReq.Header.Set("X-Access-Key", c.apiKey)
+
+	resp, err := c.httpClient.Do(httpReq)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	var result struct {
+		SimulationResults []*SimulationResponse `json:"simulation_results"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return nil, err
+	}
+
+	return result.SimulationResults, nil
+}
+
+// 使用示例
+const TenderlyUsageExample = `
+func simulateArbitrageWithTenderly() {
+    client := NewTenderlyClient(TenderlyConfig{
+        APIKey:      "your-api-key",
+        AccountSlug: "your-account",
+        ProjectSlug: "your-project",
+    })
+
+    // 构建套利交易
+    req := &SimulationRequest{
+        NetworkID: "1", // Ethereum Mainnet
+        From:      "0xYourAddress",
+        To:        "0xRouterAddress",
+        Input:     "0x...", // 编码后的 calldata
+        Gas:       500000,
+        Value:     "0",
+        Save:      true, // 保存到仪表板
+    }
+
+    result, err := client.Simulate(context.Background(), req)
+    if err != nil {
+        log.Fatal(err)
+    }
+
+    // 检查结果
+    if result.Transaction.Status {
+        fmt.Println("模拟成功!")
+        fmt.Printf("Gas 使用: %d\n", result.Transaction.GasUsed)
+
+        // 分析资产变化
+        for _, change := range result.Transaction.TransactionInfo.AssetChanges {
+            fmt.Printf("%s %s: %s %s\n",
+                change.Type,
+                change.TokenInfo.Symbol,
+                change.Amount,
+                change.To)
+        }
+    } else {
+        fmt.Println("模拟失败!")
+        if result.Transaction.TransactionInfo.CallTrace != nil {
+            fmt.Printf("错误: %s\n", result.Transaction.TransactionInfo.CallTrace.Error)
+        }
+    }
+}
+`
+```
+
+### A.2 Tenderly 状态覆盖
+
+```go
+// Tenderly 高级状态覆盖
+package simulation
+
+// OverrideBalance 覆盖余额
+func (c *TenderlyClient) SimulateWithBalanceOverride(
+	ctx context.Context,
+	from, to common.Address,
+	input []byte,
+	overrideBalance *big.Int,
+) (*SimulationResponse, error) {
+	req := &SimulationRequest{
+		NetworkID: "1",
+		From:      from.Hex(),
+		To:        to.Hex(),
+		Input:     common.Bytes2Hex(input),
+		Gas:       1000000,
+		StateObjects: map[string]StateObj{
+			from.Hex(): {
+				Balance: fmt.Sprintf("0x%x", overrideBalance),
+			},
+		},
+	}
+
+	return c.Simulate(ctx, req)
+}
+
+// SimulateWithContractOverride 覆盖合约代码
+func (c *TenderlyClient) SimulateWithContractOverride(
+	ctx context.Context,
+	from, to common.Address,
+	input []byte,
+	contractAddress common.Address,
+	newCode []byte,
+) (*SimulationResponse, error) {
+	req := &SimulationRequest{
+		NetworkID: "1",
+		From:      from.Hex(),
+		To:        to.Hex(),
+		Input:     common.Bytes2Hex(input),
+		Gas:       1000000,
+		StateObjects: map[string]StateObj{
+			contractAddress.Hex(): {
+				Code: common.Bytes2Hex(newCode),
+			},
+		},
+	}
+
+	return c.Simulate(ctx, req)
+}
+
+// SimulateWithStorageOverride 覆盖存储
+func (c *TenderlyClient) SimulateWithStorageOverride(
+	ctx context.Context,
+	from, to common.Address,
+	input []byte,
+	storageOverrides map[common.Address]map[common.Hash]common.Hash,
+) (*SimulationResponse, error) {
+	stateObjects := make(map[string]StateObj)
+
+	for addr, storage := range storageOverrides {
+		storageMap := make(map[string]string)
+		for slot, value := range storage {
+			storageMap[slot.Hex()] = value.Hex()
+		}
+		stateObjects[addr.Hex()] = StateObj{
+			Storage: storageMap,
+		}
+	}
+
+	req := &SimulationRequest{
+		NetworkID:    "1",
+		From:         from.Hex(),
+		To:           to.Hex(),
+		Input:        common.Bytes2Hex(input),
+		Gas:          1000000,
+		StateObjects: stateObjects,
+	}
+
+	return c.Simulate(ctx, req)
+}
+```
+
+---
+
+## 附录 B：Foundry Anvil Fork 模式
+
+### B.1 Anvil 集成
+
+Anvil 是 Foundry 提供的本地节点，支持 fork 主网状态。
+
+```go
+// Foundry Anvil 集成
+package simulation
+
+import (
+	"context"
+	"encoding/json"
+	"math/big"
+	"os/exec"
+	"time"
+
+	"github.com/ethereum/go-ethereum/common"
+	"github.com/ethereum/go-ethereum/ethclient"
+	"github.com/ethereum/go-ethereum/rpc"
+)
+
+// AnvilClient Anvil 客户端
+type AnvilClient struct {
+	process *exec.Cmd
+	client  *ethclient.Client
+	rpc     *rpc.Client
+	port    int
+}
+
+// AnvilConfig Anvil 配置
+type AnvilConfig struct {
+	ForkURL       string
+	ForkBlockNumber *big.Int
+	Port          int
+	Accounts      int
+	Balance       *big.Int  // 每个账户的初始余额
+	ChainID       *big.Int
+	GasLimit      uint64
+	GasPrice      *big.Int
+}
+
+// StartAnvil 启动 Anvil 实例
+func StartAnvil(config AnvilConfig) (*AnvilClient, error) {
+	args := []string{}
+
+	if config.ForkURL != "" {
+		args = append(args, "--fork-url", config.ForkURL)
+	}
+
+	if config.ForkBlockNumber != nil {
+		args = append(args, "--fork-block-number", config.ForkBlockNumber.String())
+	}
+
+	if config.Port > 0 {
+		args = append(args, "--port", fmt.Sprintf("%d", config.Port))
+	} else {
+		config.Port = 8545
+	}
+
+	if config.Accounts > 0 {
+		args = append(args, "--accounts", fmt.Sprintf("%d", config.Accounts))
+	}
+
+	if config.Balance != nil {
+		args = append(args, "--balance", config.Balance.String())
+	}
+
+	if config.ChainID != nil {
+		args = append(args, "--chain-id", config.ChainID.String())
+	}
+
+	// 启动 Anvil
+	cmd := exec.Command("anvil", args...)
+	if err := cmd.Start(); err != nil {
+		return nil, fmt.Errorf("failed to start anvil: %w", err)
+	}
+
+	// 等待 Anvil 启动
+	time.Sleep(2 * time.Second)
+
+	// 连接
+	rpcURL := fmt.Sprintf("http://localhost:%d", config.Port)
+	client, err := ethclient.Dial(rpcURL)
+	if err != nil {
+		cmd.Process.Kill()
+		return nil, err
+	}
+
+	rpcClient, err := rpc.Dial(rpcURL)
+	if err != nil {
+		cmd.Process.Kill()
+		return nil, err
+	}
+
+	return &AnvilClient{
+		process: cmd,
+		client:  client,
+		rpc:     rpcClient,
+		port:    config.Port,
+	}, nil
+}
+
+// Stop 停止 Anvil
+func (a *AnvilClient) Stop() error {
+	if a.process != nil {
+		return a.process.Process.Kill()
+	}
+	return nil
+}
+
+// Client 获取 ethclient
+func (a *AnvilClient) Client() *ethclient.Client {
+	return a.client
+}
+
+// Anvil 专用 RPC 方法
+
+// SetBalance 设置账户余额 (anvil_setBalance)
+func (a *AnvilClient) SetBalance(ctx context.Context, address common.Address, balance *big.Int) error {
+	return a.rpc.CallContext(ctx, nil, "anvil_setBalance",
+		address.Hex(),
+		fmt.Sprintf("0x%x", balance))
+}
+
+// SetCode 设置合约代码 (anvil_setCode)
+func (a *AnvilClient) SetCode(ctx context.Context, address common.Address, code []byte) error {
+	return a.rpc.CallContext(ctx, nil, "anvil_setCode",
+		address.Hex(),
+		common.Bytes2Hex(code))
+}
+
+// SetStorageAt 设置存储槽 (anvil_setStorageAt)
+func (a *AnvilClient) SetStorageAt(ctx context.Context, address common.Address, slot, value common.Hash) error {
+	return a.rpc.CallContext(ctx, nil, "anvil_setStorageAt",
+		address.Hex(),
+		slot.Hex(),
+		value.Hex())
+}
+
+// Impersonate 模拟账户 (anvil_impersonateAccount)
+func (a *AnvilClient) Impersonate(ctx context.Context, address common.Address) error {
+	return a.rpc.CallContext(ctx, nil, "anvil_impersonateAccount", address.Hex())
+}
+
+// StopImpersonating 停止模拟 (anvil_stopImpersonatingAccount)
+func (a *AnvilClient) StopImpersonating(ctx context.Context, address common.Address) error {
+	return a.rpc.CallContext(ctx, nil, "anvil_stopImpersonatingAccount", address.Hex())
+}
+
+// Mine 挖矿 (anvil_mine)
+func (a *AnvilClient) Mine(ctx context.Context, blocks uint64) error {
+	return a.rpc.CallContext(ctx, nil, "anvil_mine", blocks)
+}
+
+// SetNextBlockTimestamp 设置下一区块时间戳 (anvil_setNextBlockTimestamp)
+func (a *AnvilClient) SetNextBlockTimestamp(ctx context.Context, timestamp uint64) error {
+	return a.rpc.CallContext(ctx, nil, "anvil_setNextBlockTimestamp", timestamp)
+}
+
+// Snapshot 创建快照 (anvil_snapshot)
+func (a *AnvilClient) Snapshot(ctx context.Context) (string, error) {
+	var result string
+	err := a.rpc.CallContext(ctx, &result, "evm_snapshot")
+	return result, err
+}
+
+// Revert 恢复到快照 (anvil_revert)
+func (a *AnvilClient) Revert(ctx context.Context, snapshotID string) error {
+	return a.rpc.CallContext(ctx, nil, "evm_revert", snapshotID)
+}
+
+// Reset 重置状态 (anvil_reset)
+func (a *AnvilClient) Reset(ctx context.Context, forkURL string, blockNumber *big.Int) error {
+	params := map[string]interface{}{
+		"forking": map[string]interface{}{
+			"jsonRpcUrl": forkURL,
+		},
+	}
+	if blockNumber != nil {
+		params["forking"].(map[string]interface{})["blockNumber"] = blockNumber.Uint64()
+	}
+	return a.rpc.CallContext(ctx, nil, "anvil_reset", params)
+}
+```
+
+### B.2 Anvil 套利测试
+
+```go
+// 使用 Anvil 进行套利测试
+package simulation
+
+import (
+	"context"
+	"math/big"
+
+	"github.com/ethereum/go-ethereum/common"
+	"github.com/ethereum/go-ethereum/core/types"
+)
+
+// AnvilArbitrageTest Anvil 套利测试
+type AnvilArbitrageTest struct {
+	anvil *AnvilClient
+}
+
+func NewAnvilArbitrageTest(forkURL string, blockNumber *big.Int) (*AnvilArbitrageTest, error) {
+	anvil, err := StartAnvil(AnvilConfig{
+		ForkURL:         forkURL,
+		ForkBlockNumber: blockNumber,
+		Port:            8546,
+		Accounts:        10,
+		Balance:         new(big.Int).Mul(big.NewInt(10000), big.NewInt(1e18)),
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	return &AnvilArbitrageTest{anvil: anvil}, nil
+}
+
+// TestArbitrageWithWhale 模拟巨鲸账户进行套利测试
+func (t *AnvilArbitrageTest) TestArbitrageWithWhale(
+	ctx context.Context,
+	whaleAddress common.Address,
+	arbitrageTx *types.Transaction,
+) (*TestResult, error) {
+	// 1. 创建快照
+	snapshot, err := t.anvil.Snapshot(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer t.anvil.Revert(ctx, snapshot)
+
+	// 2. 模拟巨鲸账户
+	if err := t.anvil.Impersonate(ctx, whaleAddress); err != nil {
+		return nil, err
+	}
+	defer t.anvil.StopImpersonating(ctx, whaleAddress)
+
+	// 3. 获取初始余额
+	initialBalance, err := t.anvil.Client().BalanceAt(ctx, whaleAddress, nil)
+	if err != nil {
+		return nil, err
+	}
+
+	// 4. 发送套利交易
+	err = t.anvil.Client().SendTransaction(ctx, arbitrageTx)
+	if err != nil {
+		return &TestResult{
+			Success: false,
+			Error:   err.Error(),
+		}, nil
+	}
+
+	// 5. 挖一个区块
+	if err := t.anvil.Mine(ctx, 1); err != nil {
+		return nil, err
+	}
+
+	// 6. 获取交易收据
+	receipt, err := t.anvil.Client().TransactionReceipt(ctx, arbitrageTx.Hash())
+	if err != nil {
+		return nil, err
+	}
+
+	// 7. 获取最终余额
+	finalBalance, err := t.anvil.Client().BalanceAt(ctx, whaleAddress, nil)
+	if err != nil {
+		return nil, err
+	}
+
+	// 8. 计算利润
+	profit := new(big.Int).Sub(finalBalance, initialBalance)
+	gasCost := new(big.Int).Mul(big.NewInt(int64(receipt.GasUsed)), arbitrageTx.GasPrice())
+	profit.Add(profit, gasCost) // 加回 gas 成本以获得纯利润
+
+	return &TestResult{
+		Success:        receipt.Status == 1,
+		GasUsed:        receipt.GasUsed,
+		InitialBalance: initialBalance,
+		FinalBalance:   finalBalance,
+		Profit:         profit,
+	}, nil
+}
+
+// TestResult 测试结果
+type TestResult struct {
+	Success        bool
+	Error          string
+	GasUsed        uint64
+	InitialBalance *big.Int
+	FinalBalance   *big.Int
+	Profit         *big.Int
+}
+
+// TestPriceImpact 测试价格影响
+func (t *AnvilArbitrageTest) TestPriceImpact(
+	ctx context.Context,
+	poolAddress common.Address,
+	swapAmount *big.Int,
+) (*PriceImpactResult, error) {
+	// 1. 获取交换前的储备
+	reservesBefore, err := t.getPoolReserves(ctx, poolAddress)
+	if err != nil {
+		return nil, err
+	}
+
+	// 2. 计算价格影响
+	// 价格影响 = (newPrice - oldPrice) / oldPrice * 100%
+
+	// 3. 模拟交换
+	snapshot, _ := t.anvil.Snapshot(ctx)
+	defer t.anvil.Revert(ctx, snapshot)
+
+	// ... 执行 swap
+
+	// 4. 获取交换后的储备
+	reservesAfter, err := t.getPoolReserves(ctx, poolAddress)
+	if err != nil {
+		return nil, err
+	}
+
+	return &PriceImpactResult{
+		ReservesBefore: reservesBefore,
+		ReservesAfter:  reservesAfter,
+	}, nil
+}
+
+// PriceImpactResult 价格影响结果
+type PriceImpactResult struct {
+	ReservesBefore *PoolReserves
+	ReservesAfter  *PoolReserves
+	PriceImpact    float64
+}
+
+// PoolReserves 池子储备
+type PoolReserves struct {
+	Reserve0 *big.Int
+	Reserve1 *big.Int
+}
+
+// 使用示例
+const AnvilUsageExample = `
+func main() {
+    // 启动 Anvil fork 主网
+    test, err := NewAnvilArbitrageTest(
+        "https://eth-mainnet.g.alchemy.com/v2/YOUR_KEY",
+        nil, // 使用最新区块
+    )
+    if err != nil {
+        log.Fatal(err)
+    }
+    defer test.anvil.Stop()
+
+    // 模拟 Uniswap Router 作为发送者
+    routerAddress := common.HexToAddress("0x7a250d5630B4cF539739dF2C5dAcb4c659F2488D")
+
+    // 构建套利交易
+    tx := types.NewTransaction(...)
+
+    // 测试
+    result, err := test.TestArbitrageWithWhale(
+        context.Background(),
+        routerAddress,
+        tx,
+    )
+    if err != nil {
+        log.Fatal(err)
+    }
+
+    fmt.Printf("成功: %v\n", result.Success)
+    fmt.Printf("Gas: %d\n", result.GasUsed)
+    fmt.Printf("利润: %s\n", result.Profit.String())
+}
+`
+```
+
+---
+
+## 附录 C：Debug Trace 分析
+
+### C.1 Debug Trace API
+
+```go
+// Debug Trace API 集成
+package simulation
+
+import (
+	"context"
+	"encoding/json"
+	"math/big"
+
+	"github.com/ethereum/go-ethereum/common"
+	"github.com/ethereum/go-ethereum/rpc"
+)
+
+// DebugTraceClient Debug Trace 客户端
+type DebugTraceClient struct {
+	rpc *rpc.Client
+}
+
+func NewDebugTraceClient(rpcURL string) (*DebugTraceClient, error) {
+	client, err := rpc.Dial(rpcURL)
+	if err != nil {
+		return nil, err
+	}
+	return &DebugTraceClient{rpc: client}, nil
+}
+
+// TraceConfig 追踪配置
+type TraceConfig struct {
+	DisableStorage   bool   `json:"disableStorage,omitempty"`
+	DisableStack     bool   `json:"disableStack,omitempty"`
+	EnableMemory     bool   `json:"enableMemory,omitempty"`
+	EnableReturnData bool   `json:"enableReturnData,omitempty"`
+	Tracer           string `json:"tracer,omitempty"` // "callTracer", "prestateTracer"
+	TracerConfig     *TracerConfig `json:"tracerConfig,omitempty"`
+}
+
+// TracerConfig 追踪器配置
+type TracerConfig struct {
+	OnlyTopCall bool `json:"onlyTopCall,omitempty"`
+	WithLog     bool `json:"withLog,omitempty"`
+}
+
+// StructLog 结构化日志
+type StructLog struct {
+	PC          uint64            `json:"pc"`
+	Op          string            `json:"op"`
+	Gas         uint64            `json:"gas"`
+	GasCost     uint64            `json:"gasCost"`
+	Depth       int               `json:"depth"`
+	Error       string            `json:"error,omitempty"`
+	Stack       []string          `json:"stack,omitempty"`
+	Memory      []string          `json:"memory,omitempty"`
+	Storage     map[string]string `json:"storage,omitempty"`
+	ReturnData  string            `json:"returnData,omitempty"`
+}
+
+// ExecutionResult 执行结果
+type ExecutionResult struct {
+	Gas         uint64       `json:"gas"`
+	Failed      bool         `json:"failed"`
+	ReturnValue string       `json:"returnValue"`
+	StructLogs  []StructLog  `json:"structLogs"`
+}
+
+// CallFrame 调用帧 (callTracer)
+type CallFrame struct {
+	Type         string       `json:"type"`
+	From         string       `json:"from"`
+	To           string       `json:"to,omitempty"`
+	Value        string       `json:"value,omitempty"`
+	Gas          string       `json:"gas"`
+	GasUsed      string       `json:"gasUsed"`
+	Input        string       `json:"input"`
+	Output       string       `json:"output,omitempty"`
+	Error        string       `json:"error,omitempty"`
+	RevertReason string       `json:"revertReason,omitempty"`
+	Calls        []CallFrame  `json:"calls,omitempty"`
+	Logs         []TraceLog   `json:"logs,omitempty"`
+}
+
+// TraceLog 追踪日志
+type TraceLog struct {
+	Address  string   `json:"address"`
+	Topics   []string `json:"topics"`
+	Data     string   `json:"data"`
+}
+
+// PrestateTrace 预状态追踪
+type PrestateTrace struct {
+	Pre  map[string]AccountState `json:"pre"`
+	Post map[string]AccountState `json:"post"`
+}
+
+// AccountState 账户状态
+type AccountState struct {
+	Balance string                     `json:"balance,omitempty"`
+	Nonce   uint64                     `json:"nonce,omitempty"`
+	Code    string                     `json:"code,omitempty"`
+	Storage map[string]string          `json:"storage,omitempty"`
+}
+
+// TraceTransaction 追踪交易
+func (d *DebugTraceClient) TraceTransaction(
+	ctx context.Context,
+	txHash common.Hash,
+	config *TraceConfig,
+) (*ExecutionResult, error) {
+	var result ExecutionResult
+	err := d.rpc.CallContext(ctx, &result, "debug_traceTransaction", txHash.Hex(), config)
+	return &result, err
+}
+
+// TraceTransactionWithCallTracer 使用 callTracer
+func (d *DebugTraceClient) TraceTransactionWithCallTracer(
+	ctx context.Context,
+	txHash common.Hash,
+) (*CallFrame, error) {
+	config := &TraceConfig{
+		Tracer: "callTracer",
+		TracerConfig: &TracerConfig{
+			WithLog: true,
+		},
+	}
+
+	var result CallFrame
+	err := d.rpc.CallContext(ctx, &result, "debug_traceTransaction", txHash.Hex(), config)
+	return &result, err
+}
+
+// TraceTransactionWithPrestateTracer 使用 prestateTracer
+func (d *DebugTraceClient) TraceTransactionWithPrestateTracer(
+	ctx context.Context,
+	txHash common.Hash,
+) (*PrestateTrace, error) {
+	config := &TraceConfig{
+		Tracer: "prestateTracer",
+		TracerConfig: &TracerConfig{
+			OnlyTopCall: false,
+		},
+	}
+
+	var result PrestateTrace
+	err := d.rpc.CallContext(ctx, &result, "debug_traceTransaction", txHash.Hex(), config)
+	return &result, err
+}
+
+// TraceCall 追踪 call
+func (d *DebugTraceClient) TraceCall(
+	ctx context.Context,
+	from, to common.Address,
+	data []byte,
+	value *big.Int,
+	blockNumber *big.Int,
+	config *TraceConfig,
+) (*ExecutionResult, error) {
+	callMsg := map[string]interface{}{
+		"from":  from.Hex(),
+		"to":    to.Hex(),
+		"data":  common.Bytes2Hex(data),
+	}
+	if value != nil && value.Sign() > 0 {
+		callMsg["value"] = fmt.Sprintf("0x%x", value)
+	}
+
+	blockParam := "latest"
+	if blockNumber != nil {
+		blockParam = fmt.Sprintf("0x%x", blockNumber)
+	}
+
+	var result ExecutionResult
+	err := d.rpc.CallContext(ctx, &result, "debug_traceCall", callMsg, blockParam, config)
+	return &result, err
+}
+```
+
+### C.2 Trace 分析工具
+
+```go
+// Trace 分析工具
+package simulation
+
+import (
+	"fmt"
+	"math/big"
+	"strings"
+
+	"github.com/ethereum/go-ethereum/common"
+)
+
+// TraceAnalyzer Trace 分析器
+type TraceAnalyzer struct {
+	knownContracts map[common.Address]string // 地址 -> 名称
+	knownMethods   map[string]string          // selector -> 名称
+}
+
+func NewTraceAnalyzer() *TraceAnalyzer {
+	return &TraceAnalyzer{
+		knownContracts: make(map[common.Address]string),
+		knownMethods:   make(map[string]string),
+	}
+}
+
+// RegisterContract 注册已知合约
+func (a *TraceAnalyzer) RegisterContract(address common.Address, name string) {
+	a.knownContracts[address] = name
+}
+
+// RegisterMethod 注册已知方法
+func (a *TraceAnalyzer) RegisterMethod(selector string, name string) {
+	a.knownMethods[selector] = name
+}
+
+// AnalyzeCallFrame 分析调用帧
+func (a *TraceAnalyzer) AnalyzeCallFrame(frame *CallFrame) *CallAnalysis {
+	analysis := &CallAnalysis{
+		Type:      frame.Type,
+		From:      frame.From,
+		To:        frame.To,
+		Value:     frame.Value,
+		GasUsed:   frame.GasUsed,
+		Error:     frame.Error,
+		SubCalls:  make([]*CallAnalysis, len(frame.Calls)),
+	}
+
+	// 解析合约名
+	if name, ok := a.knownContracts[common.HexToAddress(frame.To)]; ok {
+		analysis.ContractName = name
+	}
+
+	// 解析方法名
+	if len(frame.Input) >= 10 {
+		selector := frame.Input[:10]
+		if name, ok := a.knownMethods[selector]; ok {
+			analysis.MethodName = name
+		}
+	}
+
+	// 递归分析子调用
+	for i, subCall := range frame.Calls {
+		analysis.SubCalls[i] = a.AnalyzeCallFrame(&subCall)
+	}
+
+	// 分析日志
+	analysis.Events = a.parseEvents(frame.Logs)
+
+	return analysis
+}
+
+// CallAnalysis 调用分析结果
+type CallAnalysis struct {
+	Type         string
+	From         string
+	To           string
+	ContractName string
+	MethodName   string
+	Value        string
+	GasUsed      string
+	Error        string
+	SubCalls     []*CallAnalysis
+	Events       []*EventAnalysis
+}
+
+// EventAnalysis 事件分析
+type EventAnalysis struct {
+	ContractName string
+	EventName    string
+	Address      string
+	Topics       []string
+	Data         string
+}
+
+// parseEvents 解析事件
+func (a *TraceAnalyzer) parseEvents(logs []TraceLog) []*EventAnalysis {
+	events := make([]*EventAnalysis, len(logs))
+	for i, log := range logs {
+		event := &EventAnalysis{
+			Address: log.Address,
+			Topics:  log.Topics,
+			Data:    log.Data,
+		}
+
+		// 解析合约名
+		if name, ok := a.knownContracts[common.HexToAddress(log.Address)]; ok {
+			event.ContractName = name
+		}
+
+		events[i] = event
+	}
+	return events
+}
+
+// PrintCallTree 打印调用树
+func (a *TraceAnalyzer) PrintCallTree(analysis *CallAnalysis, indent int) {
+	prefix := strings.Repeat("  ", indent)
+
+	contractInfo := analysis.To
+	if analysis.ContractName != "" {
+		contractInfo = analysis.ContractName
+	}
+
+	methodInfo := analysis.MethodName
+	if methodInfo == "" && len(analysis.Type) > 0 {
+		methodInfo = analysis.Type
+	}
+
+	fmt.Printf("%s├─ %s.%s\n", prefix, contractInfo, methodInfo)
+
+	if analysis.Value != "" && analysis.Value != "0x0" {
+		value, _ := new(big.Int).SetString(analysis.Value[2:], 16)
+		if value.Sign() > 0 {
+			fmt.Printf("%s│  Value: %s ETH\n", prefix, weiToEth(value))
+		}
+	}
+
+	if analysis.Error != "" {
+		fmt.Printf("%s│  ❌ Error: %s\n", prefix, analysis.Error)
+	}
+
+	for _, event := range analysis.Events {
+		fmt.Printf("%s│  📝 Event: %s\n", prefix, event.EventName)
+	}
+
+	for _, subCall := range analysis.SubCalls {
+		a.PrintCallTree(subCall, indent+1)
+	}
+}
+
+// FindSLOADOperations 查找所有 SLOAD 操作
+func (a *TraceAnalyzer) FindSLOADOperations(logs []StructLog) []SLOADInfo {
+	var sloads []SLOADInfo
+
+	for _, log := range logs {
+		if log.Op == "SLOAD" && len(log.Stack) >= 1 {
+			sloads = append(sloads, SLOADInfo{
+				PC:       log.PC,
+				Depth:    log.Depth,
+				Slot:     log.Stack[len(log.Stack)-1],
+				Gas:      log.Gas,
+				GasCost:  log.GasCost,
+			})
+		}
+	}
+
+	return sloads
+}
+
+// SLOADInfo SLOAD 信息
+type SLOADInfo struct {
+	PC      uint64
+	Depth   int
+	Slot    string
+	Gas     uint64
+	GasCost uint64
+}
+
+// FindSSTOREOperations 查找所有 SSTORE 操作
+func (a *TraceAnalyzer) FindSSTOREOperations(logs []StructLog) []SSTOREInfo {
+	var sstores []SSTOREInfo
+
+	for _, log := range logs {
+		if log.Op == "SSTORE" && len(log.Stack) >= 2 {
+			sstores = append(sstores, SSTOREInfo{
+				PC:      log.PC,
+				Depth:   log.Depth,
+				Slot:    log.Stack[len(log.Stack)-1],
+				Value:   log.Stack[len(log.Stack)-2],
+				Gas:     log.Gas,
+				GasCost: log.GasCost,
+			})
+		}
+	}
+
+	return sstores
+}
+
+// SSTOREInfo SSTORE 信息
+type SSTOREInfo struct {
+	PC      uint64
+	Depth   int
+	Slot    string
+	Value   string
+	Gas     uint64
+	GasCost uint64
+}
+
+// CalculateGasBreakdown 计算 Gas 分解
+func (a *TraceAnalyzer) CalculateGasBreakdown(logs []StructLog) *GasBreakdown {
+	breakdown := &GasBreakdown{
+		ByOpcode: make(map[string]uint64),
+	}
+
+	for _, log := range logs {
+		breakdown.TotalGas += log.GasCost
+		breakdown.ByOpcode[log.Op] += log.GasCost
+
+		// 分类
+		switch {
+		case strings.HasPrefix(log.Op, "PUSH"):
+			breakdown.Stack += log.GasCost
+		case log.Op == "SLOAD" || log.Op == "SSTORE":
+			breakdown.Storage += log.GasCost
+		case log.Op == "MLOAD" || log.Op == "MSTORE" || log.Op == "MSTORE8":
+			breakdown.Memory += log.GasCost
+		case log.Op == "CALL" || log.Op == "STATICCALL" || log.Op == "DELEGATECALL":
+			breakdown.ExternalCalls += log.GasCost
+		case strings.HasPrefix(log.Op, "LOG"):
+			breakdown.Logs += log.GasCost
+		}
+	}
+
+	return breakdown
+}
+
+// GasBreakdown Gas 分解
+type GasBreakdown struct {
+	TotalGas      uint64
+	Storage       uint64
+	Memory        uint64
+	Stack         uint64
+	ExternalCalls uint64
+	Logs          uint64
+	ByOpcode      map[string]uint64
+}
+
+// PrintGasBreakdown 打印 Gas 分解
+func (g *GasBreakdown) Print() {
+	fmt.Printf("Gas Breakdown:\n")
+	fmt.Printf("  Total: %d\n", g.TotalGas)
+	fmt.Printf("  Storage (SLOAD/SSTORE): %d (%.1f%%)\n",
+		g.Storage, float64(g.Storage)/float64(g.TotalGas)*100)
+	fmt.Printf("  External Calls: %d (%.1f%%)\n",
+		g.ExternalCalls, float64(g.ExternalCalls)/float64(g.TotalGas)*100)
+	fmt.Printf("  Memory: %d (%.1f%%)\n",
+		g.Memory, float64(g.Memory)/float64(g.TotalGas)*100)
+	fmt.Printf("  Logs: %d (%.1f%%)\n",
+		g.Logs, float64(g.Logs)/float64(g.TotalGas)*100)
+
+	fmt.Printf("\nTop Opcodes by Gas:\n")
+	// Sort and print top opcodes...
+}
+```
