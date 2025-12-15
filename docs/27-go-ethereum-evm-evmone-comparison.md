@@ -6341,6 +6341,838 @@ func (db *Database) Commit(root common.Hash, report bool) error {
 
 ---
 
+## 附录 Z：Witness 生成
+
+### Z.1 无状态客户端概念
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    无状态客户端架构                              │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                  │
+│   传统有状态客户端                 无状态客户端                   │
+│   ┌─────────────────────┐         ┌─────────────────────┐       │
+│   │  Full Node          │         │  Stateless Node     │       │
+│   │  ┌───────────────┐  │         │  ┌───────────────┐  │       │
+│   │  │ State DB      │  │         │  │ No State DB   │  │       │
+│   │  │ ~900 GB       │  │         │  │ ~0 GB         │  │       │
+│   │  │               │  │         │  │               │  │       │
+│   │  │ 完整状态树    │  │         │  │ 仅验证 witness│  │       │
+│   │  └───────────────┘  │         │  └───────────────┘  │       │
+│   └─────────────────────┘         └─────────────────────┘       │
+│            │                               │                     │
+│            │ 执行区块                       │ 执行区块            │
+│            ▼                               ▼                     │
+│   ┌─────────────────────┐         ┌─────────────────────┐       │
+│   │  从本地 DB 读取状态  │         │  从 witness 读取状态 │       │
+│   │  验证状态根          │         │  验证 witness 证明   │       │
+│   └─────────────────────┘         └─────────────────────┘       │
+│                                                                  │
+│   Witness 结构                                                   │
+│   ┌─────────────────────────────────────────────────────────┐   │
+│   │  Block Witness {                                         │   │
+│   │    // 区块执行需要的所有状态数据                          │   │
+│   │    accounts: [                                           │   │
+│   │      { address, nonce, balance, code_hash, storage_root }│   │
+│   │    ],                                                    │   │
+│   │    storage: [                                            │   │
+│   │      { address, slot, value }                            │   │
+│   │    ],                                                    │   │
+│   │    codes: [                                              │   │
+│   │      { code_hash, bytecode }                             │   │
+│   │    ],                                                    │   │
+│   │    // Merkle 证明                                        │   │
+│   │    proofs: [                                             │   │
+│   │      { path, nodes[] }                                   │   │
+│   │    ]                                                     │   │
+│   │  }                                                       │   │
+│   └─────────────────────────────────────────────────────────┘   │
+│                                                                  │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### Z.2 Witness 生成实现
+
+```go
+// 文件: core/state/witness.go
+
+// Witness 收集器
+type WitnessCollector struct {
+    // 访问的账户
+    accounts map[common.Address]*AccountWitness
+    // 访问的存储槽
+    storage map[common.Address]map[common.Hash]common.Hash
+    // 访问的代码
+    codes map[common.Hash][]byte
+    // Merkle 证明节点
+    proofNodes map[common.Hash][]byte
+}
+
+type AccountWitness struct {
+    Address     common.Address
+    Nonce       uint64
+    Balance     *big.Int
+    CodeHash    common.Hash
+    StorageRoot common.Hash
+    // 证明路径
+    ProofPath   [][]byte
+}
+
+// 在执行时收集 witness
+func (w *WitnessCollector) OnAccountAccess(addr common.Address, account *types.StateAccount) {
+    if _, exists := w.accounts[addr]; !exists {
+        w.accounts[addr] = &AccountWitness{
+            Address:     addr,
+            Nonce:       account.Nonce,
+            Balance:     account.Balance,
+            CodeHash:    account.CodeHash,
+            StorageRoot: account.Root,
+        }
+    }
+}
+
+func (w *WitnessCollector) OnStorageAccess(addr common.Address, slot, value common.Hash) {
+    if w.storage[addr] == nil {
+        w.storage[addr] = make(map[common.Hash]common.Hash)
+    }
+    w.storage[addr][slot] = value
+}
+
+func (w *WitnessCollector) OnCodeAccess(codeHash common.Hash, code []byte) {
+    if _, exists := w.codes[codeHash]; !exists {
+        w.codes[codeHash] = code
+    }
+}
+
+// 生成完整 witness
+func (w *WitnessCollector) GenerateWitness(stateDB *StateDB) (*BlockWitness, error) {
+    witness := &BlockWitness{
+        Accounts: make([]AccountWitness, 0, len(w.accounts)),
+        Storage:  make([]StorageWitness, 0),
+        Codes:    make([]CodeWitness, 0, len(w.codes)),
+    }
+
+    // 收集账户证明
+    for addr, acc := range w.accounts {
+        proof, err := stateDB.GetProof(addr)
+        if err != nil {
+            return nil, err
+        }
+        acc.ProofPath = proof
+        witness.Accounts = append(witness.Accounts, *acc)
+    }
+
+    // 收集存储证明
+    for addr, slots := range w.storage {
+        for slot, value := range slots {
+            proof, err := stateDB.GetStorageProof(addr, slot)
+            if err != nil {
+                return nil, err
+            }
+            witness.Storage = append(witness.Storage, StorageWitness{
+                Address:   addr,
+                Slot:      slot,
+                Value:     value,
+                ProofPath: proof,
+            })
+        }
+    }
+
+    // 收集代码
+    for hash, code := range w.codes {
+        witness.Codes = append(witness.Codes, CodeWitness{
+            Hash: hash,
+            Code: code,
+        })
+    }
+
+    return witness, nil
+}
+```
+
+### Z.3 Verkle Witness (未来)
+
+```go
+// Verkle Trees 下的 witness 更加紧凑
+type VerkleWitness struct {
+    // 多项式承诺
+    Commitments []VerkleCommitment
+    // 开放证明 (单个证明可验证多个值)
+    Proof       *ipa.MultiProof
+    // 访问的键值对
+    Keys        [][]byte
+    Values      [][]byte
+}
+
+// Verkle witness 大小对比
+// MPT witness:  ~800 KB/block (平均)
+// Verkle witness: ~150 KB/block (平均)
+// 压缩比: ~5x
+```
+
+---
+
+## 附录 AA：Portal Network
+
+### AA.1 Portal Network 架构
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    Portal Network 架构                           │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                  │
+│   设计目标: 去中心化轻客户端数据访问                              │
+│                                                                  │
+│   ┌─────────────────────────────────────────────────────────┐   │
+│   │                   Portal Network                         │   │
+│   │  ┌─────────────┐ ┌─────────────┐ ┌─────────────────┐   │   │
+│   │  │ History     │ │ Beacon      │ │ State           │   │   │
+│   │  │ Network     │ │ Network     │ │ Network         │   │   │
+│   │  │             │ │             │ │                 │   │   │
+│   │  │ - 区块头    │ │ - 信标链数据│ │ - 状态数据      │   │   │
+│   │  │ - 区块体    │ │ - 同步委员会│ │ - 状态证明      │   │   │
+│   │  │ - 收据      │ │ - 轻客户端  │ │                 │   │   │
+│   │  │             │ │   更新      │ │                 │   │   │
+│   │  └──────┬──────┘ └──────┬──────┘ └────────┬────────┘   │   │
+│   │         │               │                  │             │   │
+│   │         └───────────────┼──────────────────┘             │   │
+│   │                         │                                 │   │
+│   │                         ▼                                 │   │
+│   │  ┌─────────────────────────────────────────────────────┐│   │
+│   │  │              Discovery v5 (DHT)                      ││   │
+│   │  │  - 基于内容寻址                                      ││   │
+│   │  │  - 数据按距离存储                                    ││   │
+│   │  │  - 激励兼容                                          ││   │
+│   │  └─────────────────────────────────────────────────────┘│   │
+│   └─────────────────────────────────────────────────────────────┘
+│                                                                  │
+│   节点参与                                                        │
+│   ┌─────────────────────────────────────────────────────────┐   │
+│   │                                                          │   │
+│   │   Full Node ─────▶ 提供数据到 Portal Network            │   │
+│   │                                                          │   │
+│   │   Portal Node ◀───▶ 存储部分数据，响应查询              │   │
+│   │                                                          │   │
+│   │   Light Client ◀── 从 Portal Network 获取数据           │   │
+│   │                                                          │   │
+│   └─────────────────────────────────────────────────────────┘   │
+│                                                                  │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### AA.2 内容寻址
+
+```go
+// Portal Network 内容 ID 计算
+type ContentKey struct {
+    NetworkID byte
+    Key       []byte
+}
+
+// History Network 内容键
+const (
+    HistoryBlockHeader      byte = 0x00
+    HistoryBlockBody        byte = 0x01
+    HistoryBlockReceipts    byte = 0x02
+    HistoryEpochAccumulator byte = 0x03
+)
+
+func HistoryBlockHeaderKey(blockHash common.Hash) ContentKey {
+    return ContentKey{
+        NetworkID: HistoryBlockHeader,
+        Key:       blockHash.Bytes(),
+    }
+}
+
+// 内容 ID = keccak256(content_key)
+func (k ContentKey) ContentID() common.Hash {
+    encoded := append([]byte{k.NetworkID}, k.Key...)
+    return crypto.Keccak256Hash(encoded)
+}
+
+// 数据存储在 XOR 距离最近的节点
+func XORDistance(a, b common.Hash) *big.Int {
+    result := new(big.Int)
+    for i := 0; i < 32; i++ {
+        result.SetBit(result, i*8, uint(a[i]^b[i]))
+    }
+    return result
+}
+
+// 查找负责存储内容的节点
+func (n *PortalNode) FindContentProviders(contentID common.Hash) []*Node {
+    // 使用 discv5 递归查找
+    return n.discv5.FindNodes(contentID)
+}
+```
+
+---
+
+## 附录 AB：SSZ 编码
+
+### AB.1 SSZ 基础
+
+```go
+// Simple Serialize (SSZ) - 以太坊共识层序列化格式
+
+// 与 RLP 对比
+// RLP: 灵活，自描述，可变长度
+// SSZ: 固定模式，高效 Merkle 化，适合零知识证明
+
+// 基本类型序列化
+type SSZEncoder struct{}
+
+// uint64 编码 (小端序，固定 8 字节)
+func (e *SSZEncoder) EncodeUint64(v uint64) []byte {
+    buf := make([]byte, 8)
+    binary.LittleEndian.PutUint64(buf, v)
+    return buf
+}
+
+// 布尔值 (1 字节)
+func (e *SSZEncoder) EncodeBool(v bool) []byte {
+    if v {
+        return []byte{0x01}
+    }
+    return []byte{0x00}
+}
+
+// 固定大小数组
+func (e *SSZEncoder) EncodeFixedBytes(v []byte, size int) []byte {
+    result := make([]byte, size)
+    copy(result, v)
+    return result
+}
+
+// 可变长度列表 (使用偏移量)
+func (e *SSZEncoder) EncodeList(items [][]byte) []byte {
+    // 计算固定部分大小 (偏移量)
+    fixedSize := len(items) * 4
+
+    // 构建偏移量和数据
+    var result []byte
+    var variableParts []byte
+    currentOffset := uint32(fixedSize)
+
+    for _, item := range items {
+        // 写入偏移量
+        offsetBytes := make([]byte, 4)
+        binary.LittleEndian.PutUint32(offsetBytes, currentOffset)
+        result = append(result, offsetBytes...)
+
+        // 累积可变部分
+        variableParts = append(variableParts, item...)
+        currentOffset += uint32(len(item))
+    }
+
+    return append(result, variableParts...)
+}
+```
+
+### AB.2 SSZ Merkle 化
+
+```go
+// SSZ 哈希树根计算
+func HashTreeRoot(obj interface{}) common.Hash {
+    chunks := Pack(obj)
+    return Merkleize(chunks)
+}
+
+// 打包成 32 字节块
+func Pack(obj interface{}) [][]byte {
+    switch v := obj.(type) {
+    case uint64:
+        chunk := make([]byte, 32)
+        binary.LittleEndian.PutUint64(chunk, v)
+        return [][]byte{chunk}
+    case []byte:
+        return packBytes(v)
+    case []uint64:
+        return packUint64s(v)
+    default:
+        panic("unsupported type")
+    }
+}
+
+func packBytes(data []byte) [][]byte {
+    // 填充到 32 字节边界
+    padded := make([]byte, ((len(data)+31)/32)*32)
+    copy(padded, data)
+
+    var chunks [][]byte
+    for i := 0; i < len(padded); i += 32 {
+        chunks = append(chunks, padded[i:i+32])
+    }
+    return chunks
+}
+
+// Merkle 化
+func Merkleize(chunks [][]byte) common.Hash {
+    // 填充到 2 的幂次
+    n := nextPowerOfTwo(len(chunks))
+    for len(chunks) < n {
+        chunks = append(chunks, zeroHash[:])
+    }
+
+    // 构建 Merkle 树
+    for len(chunks) > 1 {
+        var nextLevel [][]byte
+        for i := 0; i < len(chunks); i += 2 {
+            combined := append(chunks[i], chunks[i+1]...)
+            hash := sha256.Sum256(combined)
+            nextLevel = append(nextLevel, hash[:])
+        }
+        chunks = nextLevel
+    }
+
+    return common.BytesToHash(chunks[0])
+}
+
+// 混合长度 (用于可变长度类型)
+func MixInLength(root common.Hash, length uint64) common.Hash {
+    lengthBytes := make([]byte, 32)
+    binary.LittleEndian.PutUint64(lengthBytes, length)
+    combined := append(root.Bytes(), lengthBytes...)
+    hash := sha256.Sum256(combined)
+    return common.BytesToHash(hash[:])
+}
+```
+
+### AB.3 执行层 SSZ 提案
+
+```go
+// EIP-6493: 执行层 SSZ 化
+// 将交易、区块等从 RLP 迁移到 SSZ
+
+type SSZTransaction struct {
+    ChainID       uint64
+    Nonce         uint64
+    MaxPriorityFee uint64
+    MaxFee        uint64
+    Gas           uint64
+    To            *common.Address // Optional
+    Value         *uint256.Int
+    Data          []byte
+    AccessList    []AccessTuple
+    // EIP-4844
+    MaxFeePerBlobGas uint64
+    BlobVersionedHashes []common.Hash
+}
+
+// SSZ 执行负载 (用于共识层)
+type SSZExecutionPayload struct {
+    ParentHash    common.Hash
+    FeeRecipient  common.Address
+    StateRoot     common.Hash
+    ReceiptsRoot  common.Hash
+    LogsBloom     [256]byte
+    PrevRandao    common.Hash
+    BlockNumber   uint64
+    GasLimit      uint64
+    GasUsed       uint64
+    Timestamp     uint64
+    ExtraData     []byte   // max 32 bytes
+    BaseFeePerGas *uint256.Int
+    BlockHash     common.Hash
+    Transactions  [][]byte // SSZ encoded transactions
+    Withdrawals   []Withdrawal
+    BlobGasUsed   uint64
+    ExcessBlobGas uint64
+}
+```
+
+---
+
+## 附录 AC：MEV-Boost 详解
+
+### AC.1 MEV-Boost 架构
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    MEV-Boost 完整架构                            │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                  │
+│   ┌─────────────────┐                                           │
+│   │    Searcher     │  发现 MEV 机会                            │
+│   │  ┌───────────┐  │  - 套利                                   │
+│   │  │ Bot/Script│  │  - 清算                                   │
+│   │  └─────┬─────┘  │  - 三明治攻击                             │
+│   └────────┼────────┘                                           │
+│            │ 提交 Bundle                                         │
+│            ▼                                                     │
+│   ┌─────────────────────────────────────────────────────────┐   │
+│   │                    Block Builder                         │   │
+│   │  ┌─────────────────────────────────────────────────┐    │   │
+│   │  │  1. 收集 Bundles                                 │    │   │
+│   │  │  2. 模拟执行，计算收益                           │    │   │
+│   │  │  3. 排序优化，构建最优区块                       │    │   │
+│   │  │  4. 计算出价金额                                 │    │   │
+│   │  └─────────────────────────────────────────────────┘    │   │
+│   └────────────────────────┬────────────────────────────────┘   │
+│                            │ 提交 Bid + Block Header             │
+│                            ▼                                     │
+│   ┌─────────────────────────────────────────────────────────┐   │
+│   │                      Relay                               │   │
+│   │  ┌─────────────────────────────────────────────────┐    │   │
+│   │  │  - 验证 Builder 提交的区块                       │    │   │
+│   │  │  - 托管区块内容 (防止 MEV 窃取)                  │    │   │
+│   │  │  - 向 Proposer 展示出价                         │    │   │
+│   │  │  - 收到签名后释放区块                           │    │   │
+│   │  └─────────────────────────────────────────────────┘    │   │
+│   │  常见 Relay: Flashbots, bloXroute, Ultrasound           │   │
+│   └────────────────────────┬────────────────────────────────┘   │
+│                            │ getHeader / getPayload              │
+│                            ▼                                     │
+│   ┌─────────────────────────────────────────────────────────┐   │
+│   │                    MEV-Boost                             │   │
+│   │  ┌─────────────────────────────────────────────────┐    │   │
+│   │  │  - 本地运行的 sidecar                            │    │   │
+│   │  │  - 连接多个 Relay                               │    │   │
+│   │  │  - 选择最高出价                                 │    │   │
+│   │  │  - 实现 Builder API                             │    │   │
+│   │  └─────────────────────────────────────────────────┘    │   │
+│   └────────────────────────┬────────────────────────────────┘   │
+│                            │ Builder API                         │
+│                            ▼                                     │
+│   ┌─────────────────────────────────────────────────────────┐   │
+│   │                Consensus Client                          │   │
+│   │  ┌─────────────────────────────────────────────────┐    │   │
+│   │  │  Validator:                                      │    │   │
+│   │  │  1. registerValidator - 注册接收 MEV              │    │   │
+│   │  │  2. getHeader - 获取最佳出价                     │    │   │
+│   │  │  3. 签名 blinded block                          │    │   │
+│   │  │  4. getPayload - 获取完整区块                    │    │   │
+│   │  │  5. 广播区块                                     │    │   │
+│   │  └─────────────────────────────────────────────────┘    │   │
+│   └─────────────────────────────────────────────────────────┘   │
+│                                                                  │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### AC.2 Builder API
+
+```go
+// Builder API 接口定义
+type BuilderAPI interface {
+    // 验证者注册
+    RegisterValidator(registrations []SignedValidatorRegistration) error
+
+    // 获取区块头 (出价)
+    GetHeader(slot uint64, parentHash common.Hash, pubkey BLSPubkey) (*SignedBuilderBid, error)
+
+    // 获取完整区块
+    GetPayload(signedBlindedBlock *SignedBlindedBeaconBlock) (*ExecutionPayload, error)
+
+    // 提交区块 (Builder 使用)
+    SubmitBlock(block *SignedBuilderBlock) error
+}
+
+// 验证者注册消息
+type ValidatorRegistration struct {
+    FeeRecipient common.Address
+    GasLimit     uint64
+    Timestamp    uint64
+    Pubkey       BLSPubkey
+}
+
+// Builder 出价
+type BuilderBid struct {
+    Header *ExecutionPayloadHeader
+    Value  *uint256.Int // Wei
+    Pubkey BLSPubkey    // Builder's pubkey
+}
+
+// Blinded Block (不含交易内容)
+type BlindedBeaconBlock struct {
+    Slot          uint64
+    ProposerIndex uint64
+    ParentRoot    common.Hash
+    StateRoot     common.Hash
+    Body          *BlindedBeaconBlockBody
+}
+
+type BlindedBeaconBlockBody struct {
+    // ... 其他字段
+    ExecutionPayloadHeader *ExecutionPayloadHeader // 只有 header，没有 transactions
+}
+```
+
+### AC.3 MEV-Boost 实现
+
+```go
+// MEV-Boost sidecar 实现
+type MEVBoost struct {
+    relays       []Relay
+    registeredValidators map[BLSPubkey]*ValidatorRegistration
+}
+
+func (m *MEVBoost) GetHeader(slot uint64, parentHash common.Hash, pubkey BLSPubkey) (*SignedBuilderBid, error) {
+    var bestBid *SignedBuilderBid
+    var bestValue = big.NewInt(0)
+
+    // 并行查询所有 relay
+    results := make(chan *SignedBuilderBid, len(m.relays))
+    for _, relay := range m.relays {
+        go func(r Relay) {
+            bid, err := r.GetHeader(slot, parentHash, pubkey)
+            if err == nil {
+                results <- bid
+            } else {
+                results <- nil
+            }
+        }(relay)
+    }
+
+    // 收集结果，选择最高出价
+    for i := 0; i < len(m.relays); i++ {
+        bid := <-results
+        if bid != nil && bid.Message.Value.ToBig().Cmp(bestValue) > 0 {
+            bestBid = bid
+            bestValue = bid.Message.Value.ToBig()
+        }
+    }
+
+    return bestBid, nil
+}
+
+func (m *MEVBoost) GetPayload(signedBlock *SignedBlindedBeaconBlock) (*ExecutionPayload, error) {
+    // 从对应的 relay 获取完整 payload
+    blockHash := signedBlock.Message.Body.ExecutionPayloadHeader.BlockHash
+
+    for _, relay := range m.relays {
+        payload, err := relay.GetPayload(signedBlock)
+        if err == nil && payload.BlockHash == blockHash {
+            return payload, nil
+        }
+    }
+
+    return nil, errors.New("payload not found")
+}
+```
+
+---
+
+## 附录 AD：Hive 测试框架
+
+### AD.1 Hive 架构
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    Hive 测试框架架构                              │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                 │
+│   目的: 以太坊客户端互操作性测试                                     │
+│                                                                 │
+│   ┌─────────────────────────────────────────────────────────┐   │
+│   │                    Hive Controller                      │   │
+│   │  ┌─────────────────────────────────────────────────┐    │   │
+│   │  │  - 管理 Docker 容器                              │    │   │
+│   │  │  - 协调测试执行                                   │    │   │
+│   │  │  - 收集结果                                      │    │   │
+│   │  └─────────────────────────────────────────────────┘    │   │
+│   └────────────────────────┬────────────────────────────────┘   │
+│                            │                                    │
+│            ┌───────────────┼───────────────┐                    │
+│            │               │               │                    │
+│            ▼               ▼               ▼                    │
+│   ┌─────────────┐ ┌─────────────┐ ┌─────────────┐               │
+│   │   Geth      │ │   Besu      │ │  Nethermind │               │
+│   │  Container  │ │  Container  │ │  Container  │               │
+│   └─────────────┘ └─────────────┘ └─────────────┘               │
+│   ┌─────────────┐ ┌─────────────┐ ┌─────────────┐               │
+│   │   Erigon    │ │    Reth     │ │   evmone    │               │
+│   │  Container  │ │  Container  │ │  Container  │               │
+│   └─────────────┘ └─────────────┘ └─────────────┘               │
+│                                                                 │
+│   测试类型                                                       │
+│   ┌─────────────────────────────────────────────────────────┐   │
+│   │  1. devp2p    - P2P 协议测试                             │   │
+│   │  2. eth       - eth 协议消息                             │   │
+│   │  3. engine    - Engine API 测试                         │   │
+│   │  4. sync      - 同步测试                                 │   │
+│   │  5. rpc       - JSON-RPC 兼容性                          │   │
+│   │  6. graphql   - GraphQL API                             │   │
+│   │  7. evm       - EVM 执行一致性                            │   │
+│   └─────────────────────────────────────────────────────────┘   │
+│                                                                 │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### AD.2 Hive 测试示例
+
+```go
+// Hive 测试套件示例
+package main
+
+import (
+    "github.com/ethereum/hive/hivesim"
+)
+
+func main() {
+    suite := hivesim.Suite{
+        Name:        "eth-consensus",
+        Description: "Ethereum execution layer consensus tests",
+    }
+
+    // 添加测试
+    suite.Add(hivesim.TestSpec{
+        Name:        "state-test",
+        Description: "Run official state tests",
+        Run:         runStateTests,
+    })
+
+    suite.Add(hivesim.TestSpec{
+        Name:        "blockchain-test",
+        Description: "Run official blockchain tests",
+        Run:         runBlockchainTests,
+    })
+
+    hivesim.MustRunSuite(suite)
+}
+
+func runStateTests(t *hivesim.T) {
+    // 获取测试客户端
+    clients := t.Sim.ClientTypes()
+
+    for _, clientType := range clients {
+        t.Run(clientType.Name, func(t *hivesim.T) {
+            // 启动客户端
+            client := t.Sim.StartClient(clientType.Name, hivesim.Params{
+                "HIVE_NETWORK_ID": "1337",
+            })
+            defer client.Shutdown()
+
+            // 运行测试
+            for _, test := range getStateTests() {
+                result := executeStateTest(client, test)
+                if !result.Pass {
+                    t.Fatalf("State test failed: %s", result.Error)
+                }
+            }
+        })
+    }
+}
+
+func runBlockchainTests(t *hivesim.T) {
+    clients := t.Sim.ClientTypes()
+
+    for _, clientType := range clients {
+        t.Run(clientType.Name, func(t *hivesim.T) {
+            client := t.Sim.StartClient(clientType.Name, hivesim.Params{})
+            defer client.Shutdown()
+
+            // 导入区块并验证
+            for _, block := range testBlocks {
+                err := importBlock(client, block)
+                if err != nil {
+                    t.Fatalf("Block import failed: %v", err)
+                }
+
+                // 验证状态
+                state, err := getState(client)
+                if err != nil {
+                    t.Fatalf("Failed to get state: %v", err)
+                }
+
+                if state.Root != block.ExpectedStateRoot {
+                    t.Fatalf("State root mismatch: got %s, want %s",
+                        state.Root, block.ExpectedStateRoot)
+                }
+            }
+        })
+    }
+}
+```
+
+### AD.3 客户端 Docker 配置
+
+```dockerfile
+# Hive 客户端 Dockerfile 示例 (Geth)
+FROM golang:1.21-alpine as builder
+
+RUN apk add --no-cache gcc musl-dev linux-headers git
+
+WORKDIR /go-ethereum
+RUN git clone https://github.com/ethereum/go-ethereum.git .
+RUN go build -o /geth ./cmd/geth
+
+FROM alpine:latest
+RUN apk add --no-cache ca-certificates
+COPY --from=builder /geth /usr/local/bin/
+
+# Hive 入口脚本
+COPY hive-entrypoint.sh /
+
+ENTRYPOINT ["/hive-entrypoint.sh"]
+```
+
+```bash
+#!/bin/bash
+# hive-entrypoint.sh
+
+# 从环境变量读取配置
+NETWORK_ID=${HIVE_NETWORK_ID:-1}
+CHAIN_CONFIG=${HIVE_CHAIN_CONFIG:-""}
+
+# 初始化创世区块
+if [ -n "$HIVE_GENESIS" ]; then
+    echo "$HIVE_GENESIS" > /genesis.json
+    geth init /genesis.json
+fi
+
+# 启动 geth
+exec geth \
+    --networkid $NETWORK_ID \
+    --http \
+    --http.addr 0.0.0.0 \
+    --http.api eth,net,web3,debug,engine \
+    --authrpc.addr 0.0.0.0 \
+    --authrpc.jwtsecret /jwtsecret \
+    $@
+```
+
+### AD.4 测试结果分析
+
+```go
+// Hive 测试结果结构
+type TestResult struct {
+    Suite       string
+    Test        string
+    Client      string
+    Pass        bool
+    Details     string
+    Duration    time.Duration
+}
+
+// 生成兼容性矩阵
+func GenerateCompatibilityMatrix(results []TestResult) {
+    matrix := make(map[string]map[string]bool)
+
+    for _, r := range results {
+        if matrix[r.Test] == nil {
+            matrix[r.Test] = make(map[string]bool)
+        }
+        matrix[r.Test][r.Client] = r.Pass
+    }
+
+    // 输出矩阵
+    fmt.Println("Test Compatibility Matrix:")
+    fmt.Println("==========================")
+    for test, clients := range matrix {
+        fmt.Printf("%s:\n", test)
+        for client, pass := range clients {
+            status := "✓"
+            if !pass {
+                status = "✗"
+            }
+            fmt.Printf("  %s: %s\n", client, status)
+        }
+    }
+}
+```
+
+---
+
 ## 参考资料
 
 - [evmone GitHub](https://github.com/ethereum/evmone)

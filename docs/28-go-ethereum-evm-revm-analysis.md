@@ -8487,6 +8487,2531 @@ impl<DB: Database> FlatState<DB> {
 
 ---
 
+## 附录 AB：Witness 生成
+
+### AB.1 无状态客户端架构
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    无状态客户端架构                               │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                  │
+│   传统客户端                         无状态客户端                 │
+│   ┌─────────────────┐              ┌─────────────────┐          │
+│   │                 │              │                 │          │
+│   │  ┌───────────┐  │              │  ┌───────────┐  │          │
+│   │  │  状态根    │  │              │  │  状态根    │  │          │
+│   │  └─────┬─────┘  │              │  └─────┬─────┘  │          │
+│   │        │        │              │        │        │          │
+│   │  ┌─────▼─────┐  │              │        │        │          │
+│   │  │ 完整状态   │  │              │        X        │          │
+│   │  │  树存储    │  │              │    无本地存储    │          │
+│   │  │ (500GB+)  │  │              │                 │          │
+│   │  └───────────┘  │              │                 │          │
+│   │                 │              │                 │          │
+│   └─────────────────┘              └─────────────────┘          │
+│                                                                  │
+│   执行验证                                                        │
+│   ┌───────────────────────────────────────────────────────────┐ │
+│   │                                                           │ │
+│   │   区块 + Witness ──────────────┐                          │ │
+│   │                                │                          │ │
+│   │                         ┌──────▼──────┐                   │ │
+│   │                         │   验证器     │                   │ │
+│   │                         │             │                   │ │
+│   │                         │ 1. 解析witness│                  │ │
+│   │                         │ 2. 构建子树  │                   │ │
+│   │                         │ 3. 执行交易  │                   │ │
+│   │                         │ 4. 验证根    │                   │ │
+│   │                         └──────┬──────┘                   │ │
+│   │                                │                          │ │
+│   │                         ┌──────▼──────┐                   │ │
+│   │                         │  新状态根    │                   │ │
+│   │                         └─────────────┘                   │ │
+│   │                                                           │ │
+│   └───────────────────────────────────────────────────────────┘ │
+│                                                                  │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### AB.2 Witness 收集器实现
+
+```rust
+// Rust 实现的 Witness 收集器
+use alloy_primitives::{Address, B256, U256};
+use std::collections::{HashMap, HashSet};
+
+/// 账户 witness 数据
+#[derive(Debug, Clone)]
+pub struct AccountWitness {
+    /// 账户地址
+    pub address: Address,
+    /// 账户数据 (如果存在)
+    pub account: Option<AccountData>,
+    /// Merkle 证明路径
+    pub proof: Vec<B256>,
+}
+
+#[derive(Debug, Clone)]
+pub struct AccountData {
+    pub nonce: u64,
+    pub balance: U256,
+    pub storage_root: B256,
+    pub code_hash: B256,
+}
+
+/// 存储 witness 数据
+#[derive(Debug, Clone)]
+pub struct StorageWitness {
+    /// 存储槽
+    pub slot: U256,
+    /// 存储值
+    pub value: U256,
+    /// Merkle 证明路径
+    pub proof: Vec<B256>,
+}
+
+/// 完整的区块 witness
+#[derive(Debug, Clone)]
+pub struct BlockWitness {
+    /// 状态根
+    pub state_root: B256,
+    /// 账户 witness
+    pub accounts: HashMap<Address, AccountWitness>,
+    /// 存储 witness (地址 -> 槽 -> witness)
+    pub storage: HashMap<Address, HashMap<U256, StorageWitness>>,
+    /// 合约代码
+    pub codes: HashMap<B256, Vec<u8>>,
+}
+
+/// Witness 收集器 - 在 EVM 执行时收集访问的状态
+pub struct WitnessCollector {
+    /// 收集的 witness 数据
+    witness: BlockWitness,
+    /// 访问过的账户
+    accessed_accounts: HashSet<Address>,
+    /// 访问过的存储槽
+    accessed_storage: HashMap<Address, HashSet<U256>>,
+    /// 状态提供者
+    state_provider: Box<dyn StateProvider>,
+}
+
+impl WitnessCollector {
+    pub fn new(state_root: B256, state_provider: Box<dyn StateProvider>) -> Self {
+        Self {
+            witness: BlockWitness {
+                state_root,
+                accounts: HashMap::new(),
+                storage: HashMap::new(),
+                codes: HashMap::new(),
+            },
+            accessed_accounts: HashSet::new(),
+            accessed_storage: HashMap::new(),
+            state_provider,
+        }
+    }
+
+    /// 记录账户访问
+    pub fn access_account(&mut self, address: Address) -> Result<Option<AccountData>, WitnessError> {
+        if self.accessed_accounts.insert(address) {
+            // 首次访问，获取账户数据和证明
+            let (account, proof) = self.state_provider.get_account_with_proof(address)?;
+
+            self.witness.accounts.insert(address, AccountWitness {
+                address,
+                account: account.clone(),
+                proof,
+            });
+
+            // 如果有代码，也收集代码
+            if let Some(ref acc) = account {
+                if acc.code_hash != EMPTY_CODE_HASH {
+                    let code = self.state_provider.get_code(acc.code_hash)?;
+                    self.witness.codes.insert(acc.code_hash, code);
+                }
+            }
+
+            Ok(account)
+        } else {
+            // 已访问过，从缓存返回
+            Ok(self.witness.accounts.get(&address).and_then(|w| w.account.clone()))
+        }
+    }
+
+    /// 记录存储访问
+    pub fn access_storage(&mut self, address: Address, slot: U256) -> Result<U256, WitnessError> {
+        let slots = self.accessed_storage.entry(address).or_default();
+
+        if slots.insert(slot) {
+            // 首次访问此槽
+            let (value, proof) = self.state_provider.get_storage_with_proof(address, slot)?;
+
+            let storage_map = self.witness.storage.entry(address).or_default();
+            storage_map.insert(slot, StorageWitness {
+                slot,
+                value,
+                proof,
+            });
+
+            Ok(value)
+        } else {
+            // 已访问过
+            Ok(self.witness.storage
+                .get(&address)
+                .and_then(|m| m.get(&slot))
+                .map(|w| w.value)
+                .unwrap_or(U256::ZERO))
+        }
+    }
+
+    /// 完成收集，返回 witness
+    pub fn finalize(self) -> BlockWitness {
+        self.witness
+    }
+}
+```
+
+### AB.3 作为 Host 实现
+
+```rust
+use revm::{
+    primitives::{Address, B256, U256, AccountInfo, Bytecode},
+    Database, DatabaseRef,
+};
+
+/// 带 witness 收集的数据库包装器
+pub struct WitnessDatabase<DB> {
+    inner: DB,
+    collector: WitnessCollector,
+}
+
+impl<DB: Database> WitnessDatabase<DB> {
+    pub fn new(inner: DB, state_root: B256, state_provider: Box<dyn StateProvider>) -> Self {
+        Self {
+            inner,
+            collector: WitnessCollector::new(state_root, state_provider),
+        }
+    }
+
+    pub fn into_witness(self) -> BlockWitness {
+        self.collector.finalize()
+    }
+}
+
+impl<DB: Database> Database for WitnessDatabase<DB> {
+    type Error = DB::Error;
+
+    fn basic(&mut self, address: Address) -> Result<Option<AccountInfo>, Self::Error> {
+        // 记录访问
+        let _ = self.collector.access_account(address);
+        // 委托给内部数据库
+        self.inner.basic(address)
+    }
+
+    fn code_by_hash(&mut self, code_hash: B256) -> Result<Bytecode, Self::Error> {
+        // 代码在 access_account 中已收集
+        self.inner.code_by_hash(code_hash)
+    }
+
+    fn storage(&mut self, address: Address, slot: U256) -> Result<U256, Self::Error> {
+        // 记录存储访问
+        let _ = self.collector.access_storage(address, slot);
+        // 委托给内部数据库
+        self.inner.storage(address, slot)
+    }
+
+    fn block_hash(&mut self, number: u64) -> Result<B256, Self::Error> {
+        self.inner.block_hash(number)
+    }
+}
+```
+
+### AB.4 Verkle Witness（未来方向）
+
+```rust
+// Verkle 树 witness 结构 (EIP-6800)
+use banderwagon::{Element, Fr};
+
+/// Verkle 承诺
+#[derive(Debug, Clone)]
+pub struct VerkleCommitment(pub Element);
+
+/// Verkle 证明
+#[derive(Debug, Clone)]
+pub struct VerkleProof {
+    /// 多点证明
+    pub proof: IpaProof,
+    /// 承诺路径
+    pub commitments: Vec<VerkleCommitment>,
+    /// 深度
+    pub depths: Vec<u8>,
+}
+
+/// IPA 证明 (Inner Product Argument)
+#[derive(Debug, Clone)]
+pub struct IpaProof {
+    pub cl: Vec<Element>,
+    pub cr: Vec<Element>,
+    pub final_evaluation: Fr,
+}
+
+/// Verkle witness 数据
+#[derive(Debug, Clone)]
+pub struct VerkleWitness {
+    /// 父状态根
+    pub parent_state_root: B256,
+    /// 访问的键值对
+    pub key_values: Vec<(B256, Option<Vec<u8>>)>,
+    /// Verkle 证明
+    pub proof: VerkleProof,
+}
+
+impl VerkleWitness {
+    /// 验证 witness
+    pub fn verify(&self, state_root: &VerkleCommitment) -> bool {
+        // 1. 从键值对重建叶子节点
+        let leaves = self.key_values.iter().map(|(key, value)| {
+            verkle_hash(key, value.as_deref())
+        }).collect::<Vec<_>>();
+
+        // 2. 验证 IPA 证明
+        verify_ipa_proof(
+            state_root,
+            &leaves,
+            &self.proof,
+        )
+    }
+
+    /// 序列化为 SSZ
+    pub fn to_ssz(&self) -> Vec<u8> {
+        ssz_encode(self)
+    }
+}
+
+/// Verkle 树地址空间 (31 字节 stem + 1 字节 suffix)
+pub fn verkle_tree_key(address: Address, tree_index: U256, sub_index: u8) -> B256 {
+    let mut stem = [0u8; 31];
+
+    // 地址哈希作为 stem 前缀
+    let address_hash = pedersen_hash(&address.0);
+    stem[..20].copy_from_slice(&address_hash[..20]);
+
+    // tree_index 作为 stem 后缀
+    let index_bytes = tree_index.to_be_bytes::<32>();
+    stem[20..31].copy_from_slice(&index_bytes[21..32]);
+
+    // 组合 stem 和 sub_index
+    let mut key = [0u8; 32];
+    key[..31].copy_from_slice(&stem);
+    key[31] = sub_index;
+
+    B256::from(key)
+}
+
+// Verkle 树中的账户布局
+pub mod verkle_account_layout {
+    pub const VERSION_LEAF_KEY: u8 = 0;
+    pub const BALANCE_LEAF_KEY: u8 = 1;
+    pub const NONCE_LEAF_KEY: u8 = 2;
+    pub const CODE_HASH_LEAF_KEY: u8 = 3;
+    pub const CODE_SIZE_LEAF_KEY: u8 = 4;
+}
+```
+
+### AB.5 Witness 大小比较
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    Witness 大小比较                              │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                  │
+│   MPT Witness (当前)                                             │
+│   ┌───────────────────────────────────────────────────────────┐ │
+│   │                                                           │ │
+│   │   组成部分                    典型大小                      │ │
+│   │   ─────────────────────────────────────────────          │ │
+│   │   账户证明 (每个)              ~1.5 KB (8层)               │ │
+│   │   存储证明 (每个)              ~1.5 KB (8层)               │ │
+│   │   合约代码                     变化 (0-24KB)               │ │
+│   │                                                           │ │
+│   │   典型区块 witness                                         │ │
+│   │   - 访问 ~100 账户                                        │ │
+│   │   - 访问 ~500 存储槽                                       │ │
+│   │   - 总计: ~1-2 MB                                         │ │
+│   │                                                           │ │
+│   │   问题:                                                    │ │
+│   │   - 证明大小随树深度增长                                    │ │
+│   │   - 重复的中间节点                                         │ │
+│   │                                                           │ │
+│   └───────────────────────────────────────────────────────────┘ │
+│                                                                  │
+│   Verkle Witness (未来)                                          │
+│   ┌───────────────────────────────────────────────────────────┐ │
+│   │                                                           │ │
+│   │   组成部分                    典型大小                      │ │
+│   │   ─────────────────────────────────────────────          │ │
+│   │   键值对 (每个)                ~64 字节                    │ │
+│   │   IPA 证明 (聚合)              ~1 KB (固定)                │ │
+│   │   承诺路径                     ~256 字节                   │ │
+│   │                                                           │ │
+│   │   同等区块 witness                                         │ │
+│   │   - 访问 ~600 叶子                                        │ │
+│   │   - IPA 证明: ~1 KB                                       │ │
+│   │   - 总计: ~100-200 KB                                     │ │
+│   │                                                           │ │
+│   │   优势:                                                    │ │
+│   │   - 证明可聚合 (IPA)                                       │ │
+│   │   - 大小减少 ~10x                                         │ │
+│   │   - 验证复杂度 O(n log n)                                  │ │
+│   │                                                           │ │
+│   └───────────────────────────────────────────────────────────┘ │
+│                                                                  │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## 附录 AC：Portal Network
+
+### AC.1 架构概览
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    Portal Network 架构                           │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                  │
+│   ┌─────────────────────────────────────────────────────────┐   │
+│   │                     Portal 客户端                         │   │
+│   │                                                         │   │
+│   │  ┌─────────────┐ ┌─────────────┐ ┌─────────────┐       │   │
+│   │  │   History   │ │   State     │ │   Beacon    │       │   │
+│   │  │   Network   │ │   Network   │ │   Network   │       │   │
+│   │  │             │ │             │ │             │       │   │
+│   │  │  区块/交易   │ │  状态数据    │ │  共识数据    │       │   │
+│   │  │  收据       │ │  (未来)     │ │  light sync │       │   │
+│   │  └──────┬──────┘ └──────┬──────┘ └──────┬──────┘       │   │
+│   │         │               │               │               │   │
+│   │  ┌──────▼───────────────▼───────────────▼──────┐       │   │
+│   │  │              Discovery v5                    │       │   │
+│   │  │          (discv5 - UDP 协议)                 │       │   │
+│   │  └──────────────────────────────────────────────┘       │   │
+│   │                                                         │   │
+│   └─────────────────────────────────────────────────────────┘   │
+│                                                                  │
+│   数据分布 (DHT)                                                  │
+│   ┌─────────────────────────────────────────────────────────┐   │
+│   │                                                         │   │
+│   │   内容键 = content_id = hash(content_key)               │   │
+│   │   节点键 = node_id = hash(ENR public_key)               │   │
+│   │                                                         │   │
+│   │   距离 = XOR(content_id, node_id)                       │   │
+│   │                                                         │   │
+│   │   Node A           Node B           Node C              │   │
+│   │   ┌─────┐          ┌─────┐          ┌─────┐            │   │
+│   │   │0x1..│          │0x5..│          │0x9..│            │   │
+│   │   └──┬──┘          └──┬──┘          └──┬──┘            │   │
+│   │      │                │                │                │   │
+│   │      │   Content 0x4..│                │                │   │
+│   │      │   XOR=0x5      │   XOR=0x1      │   XOR=0xD      │   │
+│   │      │                ▼                │                │   │
+│   │      │           存储在此              │                │   │
+│   │                  (距离最近)                              │   │
+│   │                                                         │   │
+│   └─────────────────────────────────────────────────────────┘   │
+│                                                                  │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### AC.2 Rust Portal 客户端实现
+
+```rust
+// Trin - Rust 实现的 Portal Network 客户端
+use discv5::{Discv5, Enr};
+use tokio::sync::mpsc;
+
+/// Portal Network 协议 ID
+pub mod protocol_id {
+    pub const HISTORY: &[u8] = b"portal-history";
+    pub const STATE: &[u8] = b"portal-state";
+    pub const BEACON: &[u8] = b"portal-beacon";
+}
+
+/// 内容键类型
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum ContentKey {
+    /// 区块头
+    BlockHeader(BlockHeaderKey),
+    /// 区块体
+    BlockBody(BlockBodyKey),
+    /// 收据
+    Receipts(ReceiptsKey),
+    /// 区块头累加器证明
+    EpochAccumulator(EpochAccumulatorKey),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct BlockHeaderKey {
+    pub block_hash: B256,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct BlockBodyKey {
+    pub block_hash: B256,
+}
+
+impl ContentKey {
+    /// 计算内容 ID
+    pub fn content_id(&self) -> B256 {
+        match self {
+            ContentKey::BlockHeader(key) => {
+                let mut data = vec![0x00]; // selector
+                data.extend_from_slice(key.block_hash.as_slice());
+                keccak256(&data)
+            }
+            ContentKey::BlockBody(key) => {
+                let mut data = vec![0x01];
+                data.extend_from_slice(key.block_hash.as_slice());
+                keccak256(&data)
+            }
+            ContentKey::Receipts(key) => {
+                let mut data = vec![0x02];
+                data.extend_from_slice(key.block_hash.as_slice());
+                keccak256(&data)
+            }
+            ContentKey::EpochAccumulator(key) => {
+                let mut data = vec![0x03];
+                data.extend_from_slice(&key.epoch.to_be_bytes());
+                keccak256(&data)
+            }
+        }
+    }
+
+    /// SSZ 编码
+    pub fn encode(&self) -> Vec<u8> {
+        match self {
+            ContentKey::BlockHeader(key) => {
+                let mut result = vec![0x00];
+                result.extend_from_slice(key.block_hash.as_slice());
+                result
+            }
+            ContentKey::BlockBody(key) => {
+                let mut result = vec![0x01];
+                result.extend_from_slice(key.block_hash.as_slice());
+                result
+            }
+            _ => todo!(),
+        }
+    }
+}
+
+/// History Network 服务
+pub struct HistoryNetwork {
+    /// discv5 实例
+    discv5: Discv5,
+    /// 本地存储
+    storage: ContentStorage,
+    /// 存储配额 (字节)
+    storage_quota: u64,
+    /// 内容请求通道
+    request_rx: mpsc::Receiver<ContentRequest>,
+}
+
+impl HistoryNetwork {
+    pub async fn new(config: NetworkConfig) -> Result<Self, NetworkError> {
+        let enr = config.enr;
+        let listen_config = discv5::ListenConfig::default()
+            .with_ipv4(config.listen_addr, config.listen_port);
+
+        let discv5 = Discv5::new(
+            enr,
+            config.enr_key,
+            discv5::ConfigBuilder::new(listen_config)
+                .build(),
+        )?;
+
+        Ok(Self {
+            discv5,
+            storage: ContentStorage::new(config.data_dir)?,
+            storage_quota: config.storage_quota,
+            request_rx: config.request_rx,
+        })
+    }
+
+    /// 查找内容
+    pub async fn find_content(&mut self, key: ContentKey) -> Result<Option<Vec<u8>>, NetworkError> {
+        let content_id = key.content_id();
+
+        // 1. 先检查本地存储
+        if let Some(content) = self.storage.get(&content_id)? {
+            return Ok(Some(content));
+        }
+
+        // 2. 查找最近的节点
+        let closest_nodes = self.discv5.find_node(content_id.into()).await?;
+
+        // 3. 向最近节点发送 FindContent 请求
+        for node in closest_nodes.iter().take(3) {
+            match self.send_find_content(node, &key).await {
+                Ok(FindContentResponse::Content(content)) => {
+                    // 存储到本地
+                    self.storage.put(&content_id, &content)?;
+                    return Ok(Some(content));
+                }
+                Ok(FindContentResponse::Enrs(enrs)) => {
+                    // 收到更近的节点列表，继续查找
+                    for enr in enrs {
+                        if let Ok(FindContentResponse::Content(content)) =
+                            self.send_find_content(&enr, &key).await
+                        {
+                            self.storage.put(&content_id, &content)?;
+                            return Ok(Some(content));
+                        }
+                    }
+                }
+                Err(_) => continue,
+            }
+        }
+
+        Ok(None)
+    }
+
+    /// 存储并传播内容
+    pub async fn store_content(&mut self, key: ContentKey, content: Vec<u8>) -> Result<(), NetworkError> {
+        let content_id = key.content_id();
+
+        // 本地存储
+        self.storage.put(&content_id, &content)?;
+
+        // 查找应该存储此内容的节点
+        let target_nodes = self.find_nodes_for_content(&content_id).await?;
+
+        // 向它们发送 Offer
+        for node in target_nodes {
+            let _ = self.send_offer(&node, &key, &content).await;
+        }
+
+        Ok(())
+    }
+
+    async fn send_find_content(&self, node: &Enr, key: &ContentKey) -> Result<FindContentResponse, NetworkError> {
+        let request = PortalRequest::FindContent {
+            content_key: key.encode(),
+        };
+
+        let response = self.discv5.talk_req(
+            node.clone(),
+            protocol_id::HISTORY.to_vec(),
+            request.encode(),
+        ).await?;
+
+        FindContentResponse::decode(&response)
+    }
+}
+
+/// 内容存储
+pub struct ContentStorage {
+    db: sled::Db,
+    /// 当前使用的存储空间
+    used_bytes: u64,
+}
+
+impl ContentStorage {
+    pub fn new(path: PathBuf) -> Result<Self, StorageError> {
+        let db = sled::open(path)?;
+        let used_bytes = db.size_on_disk()?;
+        Ok(Self { db, used_bytes })
+    }
+
+    pub fn get(&self, content_id: &B256) -> Result<Option<Vec<u8>>, StorageError> {
+        Ok(self.db.get(content_id.as_slice())?.map(|v| v.to_vec()))
+    }
+
+    pub fn put(&mut self, content_id: &B256, content: &[u8]) -> Result<(), StorageError> {
+        self.db.insert(content_id.as_slice(), content)?;
+        self.used_bytes += content.len() as u64;
+        Ok(())
+    }
+
+    /// 基于距离的内容驱逐
+    pub fn evict_furthest(&mut self, node_id: &B256, target_size: u64) -> Result<(), StorageError> {
+        while self.used_bytes > target_size {
+            // 找到距离本节点最远的内容
+            let mut furthest_key = None;
+            let mut max_distance = U256::ZERO;
+
+            for entry in self.db.iter() {
+                let (key, value) = entry?;
+                let content_id = B256::from_slice(&key);
+                let distance = xor_distance(node_id, &content_id);
+
+                if distance > max_distance {
+                    max_distance = distance;
+                    furthest_key = Some(content_id);
+                }
+            }
+
+            if let Some(key) = furthest_key {
+                if let Some(value) = self.db.remove(key.as_slice())? {
+                    self.used_bytes -= value.len() as u64;
+                }
+            } else {
+                break;
+            }
+        }
+        Ok(())
+    }
+}
+
+/// XOR 距离计算
+pub fn xor_distance(a: &B256, b: &B256) -> U256 {
+    let a_bytes = a.as_slice();
+    let b_bytes = b.as_slice();
+    let mut result = [0u8; 32];
+
+    for i in 0..32 {
+        result[i] = a_bytes[i] ^ b_bytes[i];
+    }
+
+    U256::from_be_bytes(result)
+}
+```
+
+### AC.3 Portal Wire 协议
+
+```rust
+/// Portal 协议消息
+#[derive(Debug, Clone)]
+pub enum PortalMessage {
+    /// Ping - 保活和状态同步
+    Ping(PingMessage),
+    /// Pong - Ping 响应
+    Pong(PongMessage),
+    /// FindNodes - 查找节点
+    FindNodes(FindNodesMessage),
+    /// Nodes - FindNodes 响应
+    Nodes(NodesMessage),
+    /// FindContent - 查找内容
+    FindContent(FindContentMessage),
+    /// Content - FindContent 响应
+    Content(ContentMessage),
+    /// Offer - 提供内容
+    Offer(OfferMessage),
+    /// Accept - Offer 响应
+    Accept(AcceptMessage),
+}
+
+#[derive(Debug, Clone)]
+pub struct PingMessage {
+    pub enr_seq: u64,
+    pub custom_payload: Vec<u8>, // 用于网络特定数据
+}
+
+#[derive(Debug, Clone)]
+pub struct FindContentMessage {
+    pub content_key: Vec<u8>,
+}
+
+#[derive(Debug, Clone)]
+pub enum ContentMessage {
+    /// 连接 ID (用于 uTP 传输大内容)
+    ConnectionId(u16),
+    /// 直接返回内容 (小内容)
+    Content(Vec<u8>),
+    /// 更近的节点列表
+    Enrs(Vec<Vec<u8>>),
+}
+
+#[derive(Debug, Clone)]
+pub struct OfferMessage {
+    pub content_keys: Vec<Vec<u8>>,
+}
+
+#[derive(Debug, Clone)]
+pub struct AcceptMessage {
+    /// 连接 ID (用于 uTP)
+    pub connection_id: u16,
+    /// 接受的内容键位图
+    pub content_keys_bitmap: Vec<u8>,
+}
+
+impl PortalMessage {
+    pub fn encode(&self) -> Vec<u8> {
+        let mut result = Vec::new();
+        match self {
+            PortalMessage::Ping(msg) => {
+                result.push(0x00);
+                result.extend(msg.enr_seq.to_be_bytes());
+                result.extend(&msg.custom_payload);
+            }
+            PortalMessage::FindContent(msg) => {
+                result.push(0x04);
+                result.extend(&msg.content_key);
+            }
+            PortalMessage::Offer(msg) => {
+                result.push(0x06);
+                // SSZ 编码 content_keys 列表
+                let encoded = ssz_encode_list(&msg.content_keys);
+                result.extend(encoded);
+            }
+            _ => todo!(),
+        }
+        result
+    }
+
+    pub fn decode(data: &[u8]) -> Result<Self, DecodeError> {
+        if data.is_empty() {
+            return Err(DecodeError::EmptyData);
+        }
+
+        match data[0] {
+            0x00 => {
+                let enr_seq = u64::from_be_bytes(data[1..9].try_into()?);
+                let custom_payload = data[9..].to_vec();
+                Ok(PortalMessage::Ping(PingMessage { enr_seq, custom_payload }))
+            }
+            0x01 => {
+                let enr_seq = u64::from_be_bytes(data[1..9].try_into()?);
+                let custom_payload = data[9..].to_vec();
+                Ok(PortalMessage::Pong(PongMessage { enr_seq, custom_payload }))
+            }
+            0x04 => {
+                let content_key = data[1..].to_vec();
+                Ok(PortalMessage::FindContent(FindContentMessage { content_key }))
+            }
+            0x05 => {
+                match data[1] {
+                    0x00 => {
+                        let conn_id = u16::from_be_bytes(data[2..4].try_into()?);
+                        Ok(PortalMessage::Content(ContentMessage::ConnectionId(conn_id)))
+                    }
+                    0x01 => {
+                        let content = data[2..].to_vec();
+                        Ok(PortalMessage::Content(ContentMessage::Content(content)))
+                    }
+                    0x02 => {
+                        let enrs = ssz_decode_list(&data[2..])?;
+                        Ok(PortalMessage::Content(ContentMessage::Enrs(enrs)))
+                    }
+                    _ => Err(DecodeError::InvalidSelector),
+                }
+            }
+            _ => Err(DecodeError::UnknownMessageType),
+        }
+    }
+}
+```
+
+### AC.4 区块头累加器
+
+```rust
+/// 历史区块头累加器 (Pre-Merge)
+/// 用于验证历史区块头的有效性
+#[derive(Debug, Clone)]
+pub struct HeaderAccumulator {
+    /// 历史 epochs (每个 epoch 8192 个区块头)
+    pub historical_epochs: Vec<EpochAccumulator>,
+    /// 当前 epoch 累加器
+    pub current_epoch: EpochAccumulator,
+}
+
+/// Epoch 累加器 (Merkle Mountain Range)
+#[derive(Debug, Clone)]
+pub struct EpochAccumulator {
+    pub header_records: Vec<HeaderRecord>,
+}
+
+#[derive(Debug, Clone)]
+pub struct HeaderRecord {
+    pub block_hash: B256,
+    pub total_difficulty: U256,
+}
+
+impl HeaderAccumulator {
+    /// 获取历史区块头的证明
+    pub fn get_proof(&self, block_number: u64) -> Option<HeaderProof> {
+        let epoch_index = (block_number / EPOCH_SIZE) as usize;
+        let record_index = (block_number % EPOCH_SIZE) as usize;
+
+        if epoch_index >= self.historical_epochs.len() {
+            return None;
+        }
+
+        let epoch = &self.historical_epochs[epoch_index];
+        let proof = epoch.generate_proof(record_index);
+
+        Some(HeaderProof {
+            epoch_index: epoch_index as u64,
+            record_index: record_index as u64,
+            proof,
+        })
+    }
+
+    /// 验证区块头
+    pub fn verify_header(&self, header: &Header, proof: &HeaderProof) -> bool {
+        let epoch_index = proof.epoch_index as usize;
+
+        if epoch_index >= self.historical_epochs.len() {
+            return false;
+        }
+
+        let epoch = &self.historical_epochs[epoch_index];
+        let expected_record = HeaderRecord {
+            block_hash: header.hash(),
+            total_difficulty: header.total_difficulty,
+        };
+
+        epoch.verify_proof(
+            proof.record_index as usize,
+            &expected_record,
+            &proof.proof,
+        )
+    }
+}
+
+const EPOCH_SIZE: u64 = 8192;
+
+impl EpochAccumulator {
+    /// 生成 Merkle 证明
+    pub fn generate_proof(&self, index: usize) -> Vec<B256> {
+        let leaves: Vec<B256> = self.header_records.iter()
+            .map(|r| keccak256(&rlp_encode(r)))
+            .collect();
+
+        generate_merkle_proof(&leaves, index)
+    }
+
+    /// 验证 Merkle 证明
+    pub fn verify_proof(
+        &self,
+        index: usize,
+        record: &HeaderRecord,
+        proof: &[B256],
+    ) -> bool {
+        let leaf = keccak256(&rlp_encode(record));
+        let root = self.root();
+
+        verify_merkle_proof(&leaf, proof, index, &root)
+    }
+
+    /// 计算根哈希
+    pub fn root(&self) -> B256 {
+        let leaves: Vec<B256> = self.header_records.iter()
+            .map(|r| keccak256(&rlp_encode(r)))
+            .collect();
+
+        compute_merkle_root(&leaves)
+    }
+}
+```
+
+---
+
+## 附录 AD：SSZ 编码
+
+### AD.1 SSZ 基础
+
+```rust
+// Simple Serialize (SSZ) - 以太坊共识层序列化格式
+// Rust 实现: ssz_rs, ethereum_ssz
+
+use ssz_rs::prelude::*;
+
+/// 基本类型编码
+pub mod basic_types {
+    use super::*;
+
+    /// 无符号整数 (小端序，固定大小)
+    pub fn encode_u64(value: u64) -> Vec<u8> {
+        value.to_le_bytes().to_vec()
+    }
+
+    pub fn decode_u64(data: &[u8]) -> u64 {
+        u64::from_le_bytes(data[..8].try_into().unwrap())
+    }
+
+    /// 布尔值 (1 字节)
+    pub fn encode_bool(value: bool) -> Vec<u8> {
+        vec![if value { 1 } else { 0 }]
+    }
+
+    /// 定长字节数组
+    pub fn encode_bytes32(value: &[u8; 32]) -> Vec<u8> {
+        value.to_vec()
+    }
+}
+
+/// SSZ 容器 - 使用 derive 宏
+#[derive(SimpleSerialize, Default, Debug, Clone)]
+pub struct BeaconBlockHeader {
+    pub slot: u64,
+    pub proposer_index: u64,
+    pub parent_root: [u8; 32],
+    pub state_root: [u8; 32],
+    pub body_root: [u8; 32],
+}
+
+#[derive(SimpleSerialize, Default, Debug, Clone)]
+pub struct ExecutionPayloadHeader {
+    pub parent_hash: [u8; 32],
+    pub fee_recipient: [u8; 20],
+    pub state_root: [u8; 32],
+    pub receipts_root: [u8; 32],
+    pub logs_bloom: [u8; 256],
+    pub prev_randao: [u8; 32],
+    pub block_number: u64,
+    pub gas_limit: u64,
+    pub gas_used: u64,
+    pub timestamp: u64,
+    pub extra_data: List<u8, 32>,
+    pub base_fee_per_gas: U256,
+    pub block_hash: [u8; 32],
+    pub transactions_root: [u8; 32],
+    pub withdrawals_root: [u8; 32],
+    pub blob_gas_used: u64,
+    pub excess_blob_gas: u64,
+}
+
+/// 可变长度列表
+#[derive(SimpleSerialize, Default, Debug, Clone)]
+pub struct Transaction {
+    // List<u8, MAX_BYTES_PER_TRANSACTION>
+    pub data: List<u8, 1073741824>,
+}
+
+/// SSZ 联合类型 (Union)
+#[derive(SimpleSerialize, Debug, Clone)]
+pub enum WithdrawalCredentials {
+    BLSWithdrawal([u8; 32]),
+    ExecutionAddress([u8; 32]),
+}
+
+impl Default for WithdrawalCredentials {
+    fn default() -> Self {
+        Self::BLSWithdrawal([0u8; 32])
+    }
+}
+```
+
+### AD.2 Merkleization
+
+```rust
+use sha2::{Sha256, Digest};
+
+/// SSZ Merkleization - 计算 hash_tree_root
+pub struct Merkleizer {
+    chunks: Vec<[u8; 32]>,
+}
+
+impl Merkleizer {
+    pub fn new() -> Self {
+        Self { chunks: Vec::new() }
+    }
+
+    /// 添加一个 chunk (32 字节)
+    pub fn add_chunk(&mut self, chunk: [u8; 32]) {
+        self.chunks.push(chunk);
+    }
+
+    /// 计算 hash_tree_root
+    pub fn hash_tree_root(&self) -> [u8; 32] {
+        if self.chunks.is_empty() {
+            return [0u8; 32];
+        }
+
+        let mut chunks = self.chunks.clone();
+
+        // 填充到 2 的幂
+        let target_len = chunks.len().next_power_of_two();
+        while chunks.len() < target_len {
+            chunks.push([0u8; 32]); // 零填充
+        }
+
+        // 自底向上构建 Merkle 树
+        while chunks.len() > 1 {
+            let mut next_level = Vec::new();
+            for pair in chunks.chunks(2) {
+                let hash = hash_concat(&pair[0], &pair[1]);
+                next_level.push(hash);
+            }
+            chunks = next_level;
+        }
+
+        chunks[0]
+    }
+}
+
+/// 连接两个 32 字节值并哈希
+fn hash_concat(a: &[u8; 32], b: &[u8; 32]) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(a);
+    hasher.update(b);
+    let result = hasher.finalize();
+    result.into()
+}
+
+/// 计算基本类型的 hash_tree_root
+pub fn hash_tree_root_u64(value: u64) -> [u8; 32] {
+    let mut chunk = [0u8; 32];
+    chunk[..8].copy_from_slice(&value.to_le_bytes());
+    chunk
+}
+
+/// 计算容器的 hash_tree_root
+pub fn hash_tree_root_container<T: SimpleSerialize>(value: &T) -> [u8; 32] {
+    // 收集所有字段的 hash_tree_root
+    let field_roots = value.hash_tree_root_fields();
+
+    let mut merkleizer = Merkleizer::new();
+    for root in field_roots {
+        merkleizer.add_chunk(root);
+    }
+
+    merkleizer.hash_tree_root()
+}
+
+/// 计算列表的 hash_tree_root (需要 mix_in_length)
+pub fn hash_tree_root_list<T: SimpleSerialize>(
+    items: &[T],
+    limit: usize,
+) -> [u8; 32] {
+    // 1. 计算元素的 Merkle 根
+    let mut merkleizer = Merkleizer::new();
+    for item in items {
+        merkleizer.add_chunk(item.hash_tree_root());
+    }
+
+    // 填充到 limit 对应的容量
+    let chunks_limit = (limit * T::SSZ_FIXED_LEN).div_ceil(32);
+    let target_len = chunks_limit.next_power_of_two();
+
+    let content_root = merkleizer.hash_tree_root();
+
+    // 2. Mix in length
+    mix_in_length(content_root, items.len())
+}
+
+/// 混入长度 (用于可变长度类型)
+pub fn mix_in_length(root: [u8; 32], length: usize) -> [u8; 32] {
+    let mut length_chunk = [0u8; 32];
+    length_chunk[..8].copy_from_slice(&(length as u64).to_le_bytes());
+
+    hash_concat(&root, &length_chunk)
+}
+
+/// SSZ trait 实现示例
+pub trait SimpleSerialize: Sized + Default {
+    const SSZ_FIXED_LEN: usize;
+    const IS_VARIABLE_SIZE: bool;
+
+    fn ssz_encode(&self) -> Vec<u8>;
+    fn ssz_decode(data: &[u8]) -> Result<Self, DecodeError>;
+    fn hash_tree_root(&self) -> [u8; 32];
+    fn hash_tree_root_fields(&self) -> Vec<[u8; 32]>;
+}
+
+// 为 u64 实现
+impl SimpleSerialize for u64 {
+    const SSZ_FIXED_LEN: usize = 8;
+    const IS_VARIABLE_SIZE: bool = false;
+
+    fn ssz_encode(&self) -> Vec<u8> {
+        self.to_le_bytes().to_vec()
+    }
+
+    fn ssz_decode(data: &[u8]) -> Result<Self, DecodeError> {
+        if data.len() < 8 {
+            return Err(DecodeError::InsufficientData);
+        }
+        Ok(u64::from_le_bytes(data[..8].try_into().unwrap()))
+    }
+
+    fn hash_tree_root(&self) -> [u8; 32] {
+        hash_tree_root_u64(*self)
+    }
+
+    fn hash_tree_root_fields(&self) -> Vec<[u8; 32]> {
+        vec![self.hash_tree_root()]
+    }
+}
+```
+
+### AD.3 执行层 SSZ（EIP-6493）
+
+```rust
+// 执行层交易的 SSZ 编码 (未来方向)
+// 目前执行层使用 RLP，共识层使用 SSZ
+
+/// SSZ 编码的交易 (EIP-6493 提案)
+#[derive(SimpleSerialize, Default, Debug, Clone)]
+pub struct SszTransaction {
+    pub chain_id: u64,
+    pub nonce: u64,
+    pub max_priority_fee_per_gas: U256,
+    pub max_fee_per_gas: U256,
+    pub gas: u64,
+    pub to: Option<[u8; 20]>,  // None 表示合约创建
+    pub value: U256,
+    pub input: List<u8, 16777216>,
+    pub access_list: List<AccessTuple, 16777216>,
+    pub max_fee_per_blob_gas: U256,
+    pub blob_versioned_hashes: List<[u8; 32], 16777216>,
+    pub authorization_list: List<Authorization, 16777216>,
+}
+
+#[derive(SimpleSerialize, Default, Debug, Clone)]
+pub struct AccessTuple {
+    pub address: [u8; 20],
+    pub storage_keys: List<[u8; 32], 16777216>,
+}
+
+#[derive(SimpleSerialize, Default, Debug, Clone)]
+pub struct Authorization {
+    pub chain_id: u64,
+    pub address: [u8; 20],
+    pub nonce: u64,
+    pub y_parity: u8,
+    pub r: U256,
+    pub s: U256,
+}
+
+/// SSZ 签名交易
+#[derive(SimpleSerialize, Default, Debug, Clone)]
+pub struct SignedSszTransaction {
+    pub message: SszTransaction,
+    pub signature: EcdsaSignature,
+}
+
+#[derive(SimpleSerialize, Default, Debug, Clone)]
+pub struct EcdsaSignature {
+    pub y_parity: bool,
+    pub r: U256,
+    pub s: U256,
+}
+
+/// SSZ 收据
+#[derive(SimpleSerialize, Default, Debug, Clone)]
+pub struct SszReceipt {
+    pub status: bool,
+    pub cumulative_gas_used: u64,
+    pub logs_bloom: [u8; 256],
+    pub logs: List<SszLog, 16777216>,
+}
+
+#[derive(SimpleSerialize, Default, Debug, Clone)]
+pub struct SszLog {
+    pub address: [u8; 20],
+    pub topics: List<[u8; 32], 4>,
+    pub data: List<u8, 16777216>,
+}
+
+/// RLP 与 SSZ 转换
+pub mod conversion {
+    use super::*;
+
+    pub fn rlp_to_ssz_transaction(rlp_tx: &RlpTransaction) -> SszTransaction {
+        SszTransaction {
+            chain_id: rlp_tx.chain_id,
+            nonce: rlp_tx.nonce,
+            max_priority_fee_per_gas: rlp_tx.max_priority_fee_per_gas,
+            max_fee_per_gas: rlp_tx.max_fee_per_gas,
+            gas: rlp_tx.gas_limit,
+            to: rlp_tx.to,
+            value: rlp_tx.value,
+            input: rlp_tx.data.clone().into(),
+            access_list: rlp_tx.access_list.iter()
+                .map(|t| AccessTuple {
+                    address: t.address,
+                    storage_keys: t.storage_keys.clone().into(),
+                })
+                .collect::<Vec<_>>()
+                .into(),
+            max_fee_per_blob_gas: rlp_tx.max_fee_per_blob_gas.unwrap_or_default(),
+            blob_versioned_hashes: rlp_tx.blob_versioned_hashes.clone()
+                .unwrap_or_default()
+                .into(),
+            authorization_list: List::default(),
+        }
+    }
+}
+```
+
+### AD.4 SSZ 证明生成
+
+```rust
+/// 生成 SSZ Merkle 证明
+pub struct SszProofGenerator;
+
+impl SszProofGenerator {
+    /// 生成容器字段的证明
+    pub fn generate_field_proof<T: SimpleSerialize>(
+        container: &T,
+        field_index: usize,
+    ) -> SszProof {
+        let field_roots = container.hash_tree_root_fields();
+        let leaf = field_roots[field_index];
+
+        // 构建完整的 Merkle 树
+        let tree = build_merkle_tree(&field_roots);
+
+        // 提取证明路径
+        let proof_path = extract_proof_path(&tree, field_index);
+
+        SszProof {
+            leaf,
+            branch: proof_path,
+            index: field_index as u64,
+        }
+    }
+
+    /// 生成嵌套证明 (GeneralizedIndex)
+    pub fn generate_proof_at_gindex(
+        root: &[u8; 32],
+        tree: &MerkleTree,
+        gindex: u64,
+    ) -> SszProof {
+        let depth = 64 - gindex.leading_zeros() as usize - 1;
+        let mut branch = Vec::with_capacity(depth);
+        let mut current_gindex = gindex;
+
+        for _ in 0..depth {
+            let sibling_gindex = current_gindex ^ 1;
+            let sibling = tree.get_node(sibling_gindex)
+                .unwrap_or(&[0u8; 32]);
+            branch.push(*sibling);
+            current_gindex /= 2;
+        }
+
+        SszProof {
+            leaf: *tree.get_node(gindex).unwrap_or(&[0u8; 32]),
+            branch,
+            index: gindex,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct SszProof {
+    pub leaf: [u8; 32],
+    pub branch: Vec<[u8; 32]>,
+    pub index: u64,
+}
+
+impl SszProof {
+    /// 验证证明
+    pub fn verify(&self, root: &[u8; 32]) -> bool {
+        let mut current = self.leaf;
+        let mut index = self.index;
+
+        for sibling in &self.branch {
+            if index % 2 == 0 {
+                current = hash_concat(&current, sibling);
+            } else {
+                current = hash_concat(sibling, &current);
+            }
+            index /= 2;
+        }
+
+        &current == root
+    }
+}
+
+/// Generalized Index 计算
+pub mod gindex {
+    /// 计算容器字段的 generalized index
+    pub fn container_field_gindex(field_index: usize, num_fields: usize) -> u64 {
+        let depth = (num_fields as f64).log2().ceil() as u32;
+        let base = 1u64 << depth;
+        base + field_index as u64
+    }
+
+    /// 计算嵌套路径的 generalized index
+    pub fn concat_gindices(parent: u64, child: u64) -> u64 {
+        let child_depth = 64 - child.leading_zeros() as u64 - 1;
+        (parent << child_depth) | (child & ((1 << child_depth) - 1))
+    }
+}
+```
+
+---
+
+## 附录 AE：MEV-Boost 详解
+
+### AE.1 完整架构
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                           MEV-Boost 完整架构                                 │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│   用户交易流                                                                  │
+│   ┌─────┐                                                                    │
+│   │User │───TX───┐                                                          │
+│   └─────┘        │                                                          │
+│                  ▼                                                          │
+│   ┌──────────────────────────────────────────────────────────────┐         │
+│   │                        Public Mempool                        │         │
+│   └──────────────────────────────┬───────────────────────────────┘         │
+│                                  │                                          │
+│                                  ▼                                          │
+│   ┌──────────────────────────────────────────────────────────────┐         │
+│   │                         Searchers                            │         │
+│   │  ┌─────────────┐  ┌─────────────┐  ┌─────────────┐          │         │
+│   │  │ Arbitrage   │  │ Liquidation │  │ Sandwich    │          │         │
+│   │  │   Bot       │  │    Bot      │  │   Bot       │          │         │
+│   │  └──────┬──────┘  └──────┬──────┘  └──────┬──────┘          │         │
+│   │         │                │                │                  │         │
+│   │         └────────────────┼────────────────┘                  │         │
+│   │                          │ Bundles                           │         │
+│   └──────────────────────────┼───────────────────────────────────┘         │
+│                              ▼                                              │
+│   ┌──────────────────────────────────────────────────────────────┐         │
+│   │                         Builders                             │         │
+│   │  ┌─────────────┐  ┌─────────────┐  ┌─────────────┐          │         │
+│   │  │  Flashbots  │  │    Titan    │  │   BloXroute │          │         │
+│   │  │   Builder   │  │   Builder   │  │   Builder   │          │         │
+│   │  └──────┬──────┘  └──────┬──────┘  └──────┬──────┘          │         │
+│   │         │                │                │                  │         │
+│   │         │ Block Bids     │                │                  │         │
+│   │         └────────────────┼────────────────┘                  │         │
+│   └──────────────────────────┼───────────────────────────────────┘         │
+│                              ▼                                              │
+│   ┌──────────────────────────────────────────────────────────────┐         │
+│   │                          Relays                              │         │
+│   │  ┌───────────────────┐  ┌───────────────────┐               │         │
+│   │  │  Flashbots Relay  │  │  Ultra Sound Relay│               │         │
+│   │  │                   │  │                   │               │         │
+│   │  │ 1. 验证区块有效性  │  │ 1. 验证区块有效性 │               │         │
+│   │  │ 2. 托管区块      │  │ 2. 托管区块       │               │         │
+│   │  │ 3. 提交出价      │  │ 3. 提交出价       │               │         │
+│   │  └─────────┬─────────┘  └─────────┬─────────┘               │         │
+│   │            │                      │                          │         │
+│   │            └──────────┬───────────┘                          │         │
+│   └───────────────────────┼──────────────────────────────────────┘         │
+│                           │ getHeader (bids)                                │
+│                           ▼                                                 │
+│   ┌──────────────────────────────────────────────────────────────┐         │
+│   │                        MEV-Boost                             │         │
+│   │                    (Sidecar Service)                         │         │
+│   │                                                              │         │
+│   │  1. 聚合多个 Relay 的出价                                     │         │
+│   │  2. 选择最高出价                                              │         │
+│   │  3. 签名盲区块头                                              │         │
+│   │  4. 获取完整区块                                              │         │
+│   │                                                              │         │
+│   └───────────────────────┬──────────────────────────────────────┘         │
+│                           │ Builder API                                     │
+│                           ▼                                                 │
+│   ┌──────────────────────────────────────────────────────────────┐         │
+│   │                     Consensus Client                         │         │
+│   │  ┌─────────────────────────────────────────────────────┐    │         │
+│   │  │                   Validator                          │    │         │
+│   │  │                                                      │    │         │
+│   │  │  Slot N: 被选为 Proposer                             │    │         │
+│   │  │  1. registerValidator (每 epoch)                     │    │         │
+│   │  │  2. getHeader → 获取最高出价                          │    │         │
+│   │  │  3. 签名盲区块头                                      │    │         │
+│   │  │  4. getPayload → 获取完整区块                         │    │         │
+│   │  │  5. 广播区块                                          │    │         │
+│   │  │                                                      │    │         │
+│   │  └─────────────────────────────────────────────────────┘    │         │
+│   └──────────────────────────────────────────────────────────────┘         │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+### AE.2 Builder API（Rust 实现）
+
+```rust
+// MEV-Boost Builder API 的 Rust 实现
+use axum::{Router, routing::post, Json, extract::State};
+use alloy_primitives::{B256, U256, Address};
+
+/// Builder API 路由
+pub fn builder_api_router(state: AppState) -> Router {
+    Router::new()
+        .route("/eth/v1/builder/validators", post(register_validators))
+        .route("/eth/v1/builder/header/:slot/:parent_hash/:pubkey", axum::routing::get(get_header))
+        .route("/eth/v1/builder/blinded_blocks", post(submit_blinded_block))
+        .route("/eth/v1/builder/status", axum::routing::get(status))
+        .with_state(state)
+}
+
+/// 验证者注册
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SignedValidatorRegistration {
+    pub message: ValidatorRegistration,
+    pub signature: BlsSignature,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ValidatorRegistration {
+    pub fee_recipient: Address,
+    pub gas_limit: u64,
+    pub timestamp: u64,
+    pub pubkey: BlsPubkey,
+}
+
+async fn register_validators(
+    State(state): State<AppState>,
+    Json(registrations): Json<Vec<SignedValidatorRegistration>>,
+) -> Result<(), ApiError> {
+    for reg in registrations {
+        // 验证 BLS 签名
+        if !verify_registration_signature(&reg) {
+            return Err(ApiError::InvalidSignature);
+        }
+
+        // 存储注册信息
+        state.registrations.insert(reg.message.pubkey, reg.message);
+    }
+    Ok(())
+}
+
+/// 获取区块头 (出价)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SignedBuilderBid {
+    pub message: BuilderBid,
+    pub signature: BlsSignature,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BuilderBid {
+    pub header: ExecutionPayloadHeader,
+    pub blob_kzg_commitments: Vec<KzgCommitment>,
+    pub value: U256,
+    pub pubkey: BlsPubkey,
+}
+
+async fn get_header(
+    State(state): State<AppState>,
+    axum::extract::Path((slot, parent_hash, pubkey)): axum::extract::Path<(u64, B256, BlsPubkey)>,
+) -> Result<Json<SignedBuilderBid>, ApiError> {
+    // 从所有 relay 获取出价
+    let bids = state.fetch_bids_from_relays(slot, parent_hash, &pubkey).await?;
+
+    if bids.is_empty() {
+        return Err(ApiError::NoBidsAvailable);
+    }
+
+    // 选择最高出价
+    let best_bid = bids.into_iter()
+        .max_by_key(|b| b.message.value)
+        .unwrap();
+
+    // 验证出价
+    verify_bid(&best_bid, slot, &parent_hash)?;
+
+    Ok(Json(best_bid))
+}
+
+/// 提交盲区块
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SignedBlindedBeaconBlock {
+    pub message: BlindedBeaconBlock,
+    pub signature: BlsSignature,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BlindedBeaconBlock {
+    pub slot: u64,
+    pub proposer_index: u64,
+    pub parent_root: B256,
+    pub state_root: B256,
+    pub body: BlindedBeaconBlockBody,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BlindedBeaconBlockBody {
+    pub execution_payload_header: ExecutionPayloadHeader,
+    pub blob_kzg_commitments: Vec<KzgCommitment>,
+    // ... 其他字段
+}
+
+async fn submit_blinded_block(
+    State(state): State<AppState>,
+    Json(block): Json<SignedBlindedBeaconBlock>,
+) -> Result<Json<ExecutionPayload>, ApiError> {
+    // 验证签名
+    let proposer = state.get_proposer(block.message.slot)?;
+    if !verify_block_signature(&block, &proposer.pubkey) {
+        return Err(ApiError::InvalidSignature);
+    }
+
+    // 从 relay 获取完整 payload
+    let payload = state.get_payload_from_relay(
+        &block.message.body.execution_payload_header,
+    ).await?;
+
+    // 验证 payload 匹配 header
+    if payload.hash() != block.message.body.execution_payload_header.block_hash {
+        return Err(ApiError::PayloadMismatch);
+    }
+
+    Ok(Json(payload))
+}
+```
+
+### AE.3 MEV-Boost Sidecar 实现
+
+```rust
+// MEV-Boost sidecar 服务
+use tokio::sync::RwLock;
+use std::sync::Arc;
+
+pub struct MevBoost {
+    /// 配置的 relay 列表
+    relays: Vec<RelayClient>,
+    /// 验证者注册缓存
+    registrations: Arc<RwLock<HashMap<BlsPubkey, ValidatorRegistration>>>,
+    /// 当前最佳出价缓存
+    bid_cache: Arc<RwLock<HashMap<(u64, B256), SignedBuilderBid>>>,
+    /// 配置
+    config: MevBoostConfig,
+}
+
+#[derive(Debug, Clone)]
+pub struct MevBoostConfig {
+    /// 最小出价值 (wei)
+    pub min_bid_value: U256,
+    /// Relay 请求超时
+    pub relay_timeout: Duration,
+    /// 是否允许无 relay 出价时本地构建
+    pub fallback_to_local: bool,
+}
+
+impl MevBoost {
+    pub fn new(config: MevBoostConfig, relay_urls: Vec<String>) -> Self {
+        let relays = relay_urls.into_iter()
+            .map(|url| RelayClient::new(url))
+            .collect();
+
+        Self {
+            relays,
+            registrations: Arc::new(RwLock::new(HashMap::new())),
+            bid_cache: Arc::new(RwLock::new(HashMap::new())),
+            config,
+        }
+    }
+
+    /// 注册验证者到所有 relay
+    pub async fn register_validators(
+        &self,
+        registrations: Vec<SignedValidatorRegistration>,
+    ) -> Result<(), MevBoostError> {
+        // 并行发送到所有 relay
+        let futures: Vec<_> = self.relays.iter()
+            .map(|relay| relay.register_validators(&registrations))
+            .collect();
+
+        let results = futures::future::join_all(futures).await;
+
+        // 至少一个成功即可
+        let success_count = results.iter().filter(|r| r.is_ok()).count();
+        if success_count == 0 {
+            return Err(MevBoostError::AllRelaysFailed);
+        }
+
+        // 缓存注册信息
+        let mut cache = self.registrations.write().await;
+        for reg in registrations {
+            cache.insert(reg.message.pubkey, reg.message);
+        }
+
+        Ok(())
+    }
+
+    /// 获取最佳出价
+    pub async fn get_header(
+        &self,
+        slot: u64,
+        parent_hash: B256,
+        pubkey: &BlsPubkey,
+    ) -> Result<SignedBuilderBid, MevBoostError> {
+        // 检查缓存
+        let cache_key = (slot, parent_hash);
+        {
+            let cache = self.bid_cache.read().await;
+            if let Some(bid) = cache.get(&cache_key) {
+                return Ok(bid.clone());
+            }
+        }
+
+        // 并行从所有 relay 获取出价
+        let futures: Vec<_> = self.relays.iter()
+            .map(|relay| {
+                let timeout = self.config.relay_timeout;
+                async move {
+                    tokio::time::timeout(
+                        timeout,
+                        relay.get_header(slot, parent_hash, pubkey),
+                    ).await
+                }
+            })
+            .collect();
+
+        let results = futures::future::join_all(futures).await;
+
+        // 收集有效出价
+        let mut valid_bids: Vec<SignedBuilderBid> = Vec::new();
+        for result in results {
+            if let Ok(Ok(bid)) = result {
+                if self.validate_bid(&bid, slot, &parent_hash).is_ok() {
+                    valid_bids.push(bid);
+                }
+            }
+        }
+
+        if valid_bids.is_empty() {
+            return Err(MevBoostError::NoBidsAvailable);
+        }
+
+        // 选择最高出价
+        let best_bid = valid_bids.into_iter()
+            .filter(|b| b.message.value >= self.config.min_bid_value)
+            .max_by_key(|b| b.message.value)
+            .ok_or(MevBoostError::NoBidsAboveMinimum)?;
+
+        // 缓存
+        {
+            let mut cache = self.bid_cache.write().await;
+            cache.insert(cache_key, best_bid.clone());
+        }
+
+        Ok(best_bid)
+    }
+
+    /// 获取 payload
+    pub async fn get_payload(
+        &self,
+        signed_block: &SignedBlindedBeaconBlock,
+    ) -> Result<ExecutionPayloadWithBlobs, MevBoostError> {
+        let block_hash = signed_block.message.body.execution_payload_header.block_hash;
+
+        // 尝试从每个 relay 获取
+        for relay in &self.relays {
+            match relay.get_payload(signed_block).await {
+                Ok(payload) => {
+                    // 验证 payload
+                    if payload.execution_payload.block_hash == block_hash {
+                        return Ok(payload);
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!("Relay get_payload failed: {:?}", e);
+                    continue;
+                }
+            }
+        }
+
+        Err(MevBoostError::PayloadNotFound)
+    }
+
+    fn validate_bid(
+        &self,
+        bid: &SignedBuilderBid,
+        slot: u64,
+        parent_hash: &B256,
+    ) -> Result<(), MevBoostError> {
+        // 验证 slot
+        if bid.message.header.block_number != slot {
+            return Err(MevBoostError::InvalidSlot);
+        }
+
+        // 验证 parent hash
+        if bid.message.header.parent_hash != *parent_hash {
+            return Err(MevBoostError::InvalidParentHash);
+        }
+
+        // 验证签名
+        if !verify_builder_signature(bid) {
+            return Err(MevBoostError::InvalidSignature);
+        }
+
+        Ok(())
+    }
+}
+
+/// Relay 客户端
+pub struct RelayClient {
+    url: String,
+    client: reqwest::Client,
+}
+
+impl RelayClient {
+    pub fn new(url: String) -> Self {
+        Self {
+            url,
+            client: reqwest::Client::new(),
+        }
+    }
+
+    pub async fn register_validators(
+        &self,
+        registrations: &[SignedValidatorRegistration],
+    ) -> Result<(), RelayError> {
+        let url = format!("{}/eth/v1/builder/validators", self.url);
+        let response = self.client
+            .post(&url)
+            .json(registrations)
+            .send()
+            .await?;
+
+        if !response.status().is_success() {
+            return Err(RelayError::RegistrationFailed);
+        }
+        Ok(())
+    }
+
+    pub async fn get_header(
+        &self,
+        slot: u64,
+        parent_hash: B256,
+        pubkey: &BlsPubkey,
+    ) -> Result<SignedBuilderBid, RelayError> {
+        let url = format!(
+            "{}/eth/v1/builder/header/{}/{}/{}",
+            self.url, slot, parent_hash, pubkey
+        );
+
+        let response = self.client.get(&url).send().await?;
+
+        if response.status() == 204 {
+            return Err(RelayError::NoBid);
+        }
+
+        let bid: SignedBuilderBid = response.json().await?;
+        Ok(bid)
+    }
+
+    pub async fn get_payload(
+        &self,
+        block: &SignedBlindedBeaconBlock,
+    ) -> Result<ExecutionPayloadWithBlobs, RelayError> {
+        let url = format!("{}/eth/v1/builder/blinded_blocks", self.url);
+
+        let response = self.client
+            .post(&url)
+            .json(block)
+            .send()
+            .await?;
+
+        let payload: ExecutionPayloadWithBlobs = response.json().await?;
+        Ok(payload)
+    }
+}
+```
+
+### AE.4 收益分析
+
+```rust
+/// MEV 收益分析
+pub struct MevAnalyzer;
+
+impl MevAnalyzer {
+    /// 分析区块的 MEV 收益
+    pub fn analyze_block_mev(block: &Block, receipts: &[Receipt]) -> MevAnalysis {
+        let mut analysis = MevAnalysis::default();
+
+        // 1. 计算总 Gas 费
+        analysis.total_gas_fees = receipts.iter()
+            .map(|r| r.gas_used * r.effective_gas_price)
+            .sum();
+
+        // 2. 计算优先费 (给验证者)
+        analysis.priority_fees = receipts.iter()
+            .map(|r| {
+                r.gas_used * (r.effective_gas_price.saturating_sub(block.base_fee_per_gas))
+            })
+            .sum();
+
+        // 3. 检测 MEV 模式
+        analysis.patterns = Self::detect_mev_patterns(&block.transactions, receipts);
+
+        // 4. 估算 MEV 提取值
+        analysis.extracted_mev = Self::estimate_extracted_mev(&analysis.patterns);
+
+        analysis
+    }
+
+    fn detect_mev_patterns(txs: &[Transaction], receipts: &[Receipt]) -> Vec<MevPattern> {
+        let mut patterns = Vec::new();
+
+        // 检测三明治攻击
+        for window in txs.windows(3) {
+            if Self::is_sandwich(&window[0], &window[1], &window[2]) {
+                patterns.push(MevPattern::Sandwich {
+                    front_run: window[0].hash(),
+                    victim: window[1].hash(),
+                    back_run: window[2].hash(),
+                });
+            }
+        }
+
+        // 检测套利
+        for (i, tx) in txs.iter().enumerate() {
+            if let Some(arb) = Self::detect_arbitrage(tx, &receipts[i]) {
+                patterns.push(arb);
+            }
+        }
+
+        // 检测清算
+        for (i, tx) in txs.iter().enumerate() {
+            if let Some(liq) = Self::detect_liquidation(tx, &receipts[i]) {
+                patterns.push(liq);
+            }
+        }
+
+        patterns
+    }
+
+    fn is_sandwich(front: &Transaction, victim: &Transaction, back: &Transaction) -> bool {
+        // 检查是否同一发送者的前后交易
+        if front.from != back.from {
+            return false;
+        }
+
+        // 检查是否涉及相同的 DEX 合约
+        if front.to != victim.to || victim.to != back.to {
+            return false;
+        }
+
+        // 检查交易方向 (买-卖 或 卖-买)
+        // 简化检测：检查方法选择器
+        let front_selector = &front.input[..4];
+        let back_selector = &back.input[..4];
+
+        // swap 方法选择器
+        let swap_exact_tokens = [0x38, 0xed, 0x17, 0x39]; // swapExactTokensForTokens
+        let swap_tokens_exact = [0x88, 0x03, 0xdb, 0xee]; // swapTokensForExactTokens
+
+        (front_selector == swap_exact_tokens && back_selector == swap_tokens_exact) ||
+        (front_selector == swap_tokens_exact && back_selector == swap_exact_tokens)
+    }
+
+    fn estimate_extracted_mev(patterns: &[MevPattern]) -> U256 {
+        patterns.iter()
+            .map(|p| match p {
+                MevPattern::Sandwich { .. } => U256::from(1000) * U256::from(10).pow(U256::from(18)), // 估算
+                MevPattern::Arbitrage { profit, .. } => *profit,
+                MevPattern::Liquidation { bonus, .. } => *bonus,
+            })
+            .sum()
+    }
+}
+
+#[derive(Debug, Default)]
+pub struct MevAnalysis {
+    pub total_gas_fees: U256,
+    pub priority_fees: U256,
+    pub patterns: Vec<MevPattern>,
+    pub extracted_mev: U256,
+}
+
+#[derive(Debug)]
+pub enum MevPattern {
+    Sandwich {
+        front_run: B256,
+        victim: B256,
+        back_run: B256,
+    },
+    Arbitrage {
+        tx_hash: B256,
+        profit: U256,
+        path: Vec<Address>,
+    },
+    Liquidation {
+        tx_hash: B256,
+        protocol: String,
+        bonus: U256,
+    },
+}
+```
+
+---
+
+## 附录 AF：Hive 测试框架
+
+### AF.1 架构概览
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                         Hive 测试框架架构                                    │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│   ┌─────────────────────────────────────────────────────────────────────┐   │
+│   │                        Hive Controller                              │   │
+│   │                                                                     │   │
+│   │  ┌─────────────────┐  ┌─────────────────┐  ┌─────────────────┐    │   │
+│   │  │  Test Suites    │  │  Client Images  │  │   Result Store  │    │   │
+│   │  │                 │  │                 │  │                 │    │   │
+│   │  │  - sync         │  │  - geth         │  │  - JSON 结果    │    │   │
+│   │  │  - rpc          │  │  - reth         │  │  - 日志收集     │    │   │
+│   │  │  - devp2p       │  │  - erigon       │  │  - 性能指标     │    │   │
+│   │  │  - engine       │  │  - nethermind   │  │                 │    │   │
+│   │  │  - graphql      │  │  - besu         │  │                 │    │   │
+│   │  └────────┬────────┘  └────────┬────────┘  └────────┬────────┘    │   │
+│   │           │                    │                    │              │   │
+│   └───────────┼────────────────────┼────────────────────┼──────────────┘   │
+│               │                    │                    │                   │
+│               ▼                    ▼                    ▼                   │
+│   ┌─────────────────────────────────────────────────────────────────────┐   │
+│   │                         Docker Engine                               │   │
+│   │                                                                     │   │
+│   │   ┌───────────────┐  ┌───────────────┐  ┌───────────────┐          │   │
+│   │   │   Client A    │  │   Client B    │  │  Test Runner  │          │   │
+│   │   │   Container   │  │   Container   │  │   Container   │          │   │
+│   │   │               │  │               │  │               │          │   │
+│   │   │  ┌─────────┐  │  │  ┌─────────┐  │  │  执行测试用例  │          │   │
+│   │   │  │  Reth   │  │  │  │  Geth   │  │  │               │          │   │
+│   │   │  │ (EL)    │  │  │  │ (EL)    │  │  │  1. 启动客户端│          │   │
+│   │   │  └─────────┘  │  │  └─────────┘  │  │  2. 执行操作  │          │   │
+│   │   │               │  │               │  │  3. 验证结果  │          │   │
+│   │   └───────┬───────┘  └───────┬───────┘  └───────┬───────┘          │   │
+│   │           │                  │                  │                   │   │
+│   │           └──────────────────┼──────────────────┘                   │   │
+│   │                              │                                      │   │
+│   │                    Docker Network                                   │   │
+│   │                              │                                      │   │
+│   └──────────────────────────────┼──────────────────────────────────────┘   │
+│                                  │                                          │
+│                                  ▼                                          │
+│   ┌─────────────────────────────────────────────────────────────────────┐   │
+│   │                       Test Execution Flow                           │   │
+│   │                                                                     │   │
+│   │   1. Hive 读取测试套件定义                                           │   │
+│   │   2. 为每个测试构建/拉取客户端镜像                                    │   │
+│   │   3. 创建 Docker 网络                                                │   │
+│   │   4. 启动客户端容器 (带配置)                                          │   │
+│   │   5. 运行测试用例                                                    │   │
+│   │   6. 收集结果和日志                                                  │   │
+│   │   7. 生成报告                                                        │   │
+│   │                                                                     │   │
+│   └─────────────────────────────────────────────────────────────────────┘   │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+### AF.2 Reth 客户端 Dockerfile
+
+```dockerfile
+# clients/reth/Dockerfile
+FROM rust:1.75-bookworm as builder
+
+# 构建参数
+ARG RETH_VERSION=v0.1.0
+ARG FEATURES=""
+
+# 安装依赖
+RUN apt-get update && apt-get install -y \
+    cmake \
+    libclang-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+# 克隆并构建 reth
+WORKDIR /build
+RUN git clone --depth 1 --branch ${RETH_VERSION} https://github.com/paradigmxyz/reth.git
+WORKDIR /build/reth
+RUN cargo build --release --features "${FEATURES}"
+
+# 运行时镜像
+FROM debian:bookworm-slim
+
+# 安装运行时依赖
+RUN apt-get update && apt-get install -y \
+    ca-certificates \
+    curl \
+    jq \
+    && rm -rf /var/lib/apt/lists/*
+
+# 复制二进制
+COPY --from=builder /build/reth/target/release/reth /usr/local/bin/
+
+# 复制 hive 入口脚本
+COPY reth.sh /reth.sh
+RUN chmod +x /reth.sh
+
+# 暴露端口
+EXPOSE 8545 8546 8551 30303 30303/udp
+
+# 入口点
+ENTRYPOINT ["/reth.sh"]
+```
+
+### AF.3 Hive 入口脚本
+
+```bash
+#!/bin/bash
+# clients/reth/reth.sh - Reth 的 Hive 入口脚本
+
+set -e
+
+# 从环境变量获取配置
+HIVE_LOGLEVEL=${HIVE_LOGLEVEL:-3}
+HIVE_NETWORK_ID=${HIVE_NETWORK_ID:-1}
+HIVE_CHAIN_ID=${HIVE_CHAIN_ID:-1}
+HIVE_BOOTNODE=${HIVE_BOOTNODE:-}
+HIVE_GRAPHQL_ENABLED=${HIVE_GRAPHQL_ENABLED:-0}
+
+# 数据目录
+DATA_DIR="/data"
+mkdir -p $DATA_DIR
+
+# 初始化创世块
+if [ -n "$HIVE_GENESIS" ]; then
+    echo "$HIVE_GENESIS" > /tmp/genesis.json
+fi
+
+# 导入预分配账户密钥
+if [ -n "$HIVE_CLIQUE_PRIVATEKEY" ]; then
+    echo "$HIVE_CLIQUE_PRIVATEKEY" > $DATA_DIR/signer.key
+fi
+
+# 构建命令参数
+RETH_ARGS=(
+    --datadir "$DATA_DIR"
+    --chain "/tmp/genesis.json"
+    --http
+    --http.addr "0.0.0.0"
+    --http.port 8545
+    --http.api "eth,net,web3,debug,trace,txpool,admin"
+    --ws
+    --ws.addr "0.0.0.0"
+    --ws.port 8546
+    --authrpc.addr "0.0.0.0"
+    --authrpc.port 8551
+)
+
+# 日志级别
+case $HIVE_LOGLEVEL in
+    1) RETH_ARGS+=(--log.stdout.filter "error") ;;
+    2) RETH_ARGS+=(--log.stdout.filter "warn") ;;
+    3) RETH_ARGS+=(--log.stdout.filter "info") ;;
+    4) RETH_ARGS+=(--log.stdout.filter "debug") ;;
+    5) RETH_ARGS+=(--log.stdout.filter "trace") ;;
+esac
+
+# 网络配置
+RETH_ARGS+=(--network.chain-id "$HIVE_CHAIN_ID")
+
+# Bootnode
+if [ -n "$HIVE_BOOTNODE" ]; then
+    RETH_ARGS+=(--bootnodes "$HIVE_BOOTNODE")
+fi
+
+# Engine API JWT
+if [ -n "$HIVE_ENGINE_JWT" ]; then
+    echo "$HIVE_ENGINE_JWT" > $DATA_DIR/jwt.hex
+    RETH_ARGS+=(--authrpc.jwtsecret "$DATA_DIR/jwt.hex")
+fi
+
+# 终端总难度 (for merge)
+if [ -n "$HIVE_TERMINAL_TOTAL_DIFFICULTY" ]; then
+    # Reth 从 genesis 读取 TTD
+    :
+fi
+
+# 同步模式
+if [ "$HIVE_SYNC_MODE" = "snap" ]; then
+    RETH_ARGS+=(--full)
+fi
+
+# GraphQL
+if [ "$HIVE_GRAPHQL_ENABLED" = "1" ]; then
+    RETH_ARGS+=(--graphql --graphql.addr "0.0.0.0")
+fi
+
+# 导入区块 (用于同步测试)
+if [ -n "$HIVE_INIT_BLOCKS" ]; then
+    for block in $HIVE_INIT_BLOCKS; do
+        reth import "$block" --datadir "$DATA_DIR" --chain "/tmp/genesis.json"
+    done
+fi
+
+# 启动 reth
+echo "Starting reth with args: ${RETH_ARGS[@]}"
+exec reth node "${RETH_ARGS[@]}"
+```
+
+### AF.4 测试套件实现 (Rust)
+
+```rust
+// Hive 测试套件的 Rust 实现
+use hive_rs::{Simulation, TestSuite, TestSpec, Client};
+
+/// Engine API 测试套件
+pub struct EngineApiTestSuite;
+
+impl TestSuite for EngineApiTestSuite {
+    fn name(&self) -> &'static str {
+        "engine-api"
+    }
+
+    fn description(&self) -> &'static str {
+        "Engine API conformance tests for execution clients"
+    }
+
+    fn tests(&self) -> Vec<Box<dyn TestSpec>> {
+        vec![
+            Box::new(TestForkchoiceUpdated),
+            Box::new(TestNewPayload),
+            Box::new(TestGetPayload),
+            Box::new(TestExchangeCapabilities),
+            Box::new(TestInvalidPayload),
+        ]
+    }
+}
+
+/// forkchoiceUpdated 测试
+struct TestForkchoiceUpdated;
+
+impl TestSpec for TestForkchoiceUpdated {
+    fn name(&self) -> &'static str {
+        "engine_forkchoiceUpdatedV3"
+    }
+
+    fn run(&self, sim: &Simulation, client: &Client) -> TestResult {
+        // 构造 forkchoice 状态
+        let forkchoice_state = ForkchoiceState {
+            head_block_hash: client.genesis_hash(),
+            safe_block_hash: client.genesis_hash(),
+            finalized_block_hash: B256::ZERO,
+        };
+
+        // 构造 payload 属性
+        let payload_attrs = PayloadAttributes {
+            timestamp: 12,
+            prev_randao: B256::random(),
+            suggested_fee_recipient: Address::random(),
+            withdrawals: Some(vec![]),
+            parent_beacon_block_root: Some(B256::random()),
+        };
+
+        // 调用 engine_forkchoiceUpdatedV3
+        let response = client.engine_forkchoice_updated_v3(
+            forkchoice_state,
+            Some(payload_attrs),
+        )?;
+
+        // 验证响应
+        assert_eq!(response.payload_status.status, PayloadStatusEnum::Valid);
+        assert!(response.payload_id.is_some());
+
+        TestResult::Pass
+    }
+}
+
+/// newPayload 测试
+struct TestNewPayload;
+
+impl TestSpec for TestNewPayload {
+    fn name(&self) -> &'static str {
+        "engine_newPayloadV3"
+    }
+
+    fn run(&self, sim: &Simulation, client: &Client) -> TestResult {
+        // 首先获取 payload
+        let payload_id = self.get_payload_id(client)?;
+        let payload = client.engine_get_payload_v3(payload_id)?;
+
+        // 提交新 payload
+        let response = client.engine_new_payload_v3(
+            payload.execution_payload,
+            payload.blobs_bundle.commitments.clone(),
+            payload.parent_beacon_block_root,
+        )?;
+
+        // 验证
+        match response.status {
+            PayloadStatusEnum::Valid | PayloadStatusEnum::Accepted => {
+                TestResult::Pass
+            }
+            _ => TestResult::Fail(format!(
+                "Unexpected status: {:?}",
+                response.status
+            )),
+        }
+    }
+}
+
+/// 无效 payload 测试
+struct TestInvalidPayload;
+
+impl TestSpec for TestInvalidPayload {
+    fn name(&self) -> &'static str {
+        "engine_newPayloadV3_invalid"
+    }
+
+    fn run(&self, sim: &Simulation, client: &Client) -> TestResult {
+        // 构造无效 payload (错误的 state_root)
+        let mut payload = self.build_valid_payload(client)?;
+        payload.state_root = B256::random(); // 错误的状态根
+
+        let response = client.engine_new_payload_v3(
+            payload,
+            vec![],
+            B256::random(),
+        )?;
+
+        // 应该返回 INVALID
+        match response.status {
+            PayloadStatusEnum::Invalid => TestResult::Pass,
+            _ => TestResult::Fail(format!(
+                "Expected INVALID, got: {:?}",
+                response.status
+            )),
+        }
+    }
+}
+
+/// RPC 测试套件
+pub struct RpcTestSuite;
+
+impl TestSuite for RpcTestSuite {
+    fn name(&self) -> &'static str {
+        "rpc-compat"
+    }
+
+    fn tests(&self) -> Vec<Box<dyn TestSpec>> {
+        vec![
+            Box::new(TestEthBlockNumber),
+            Box::new(TestEthGetBalance),
+            Box::new(TestEthCall),
+            Box::new(TestEthEstimateGas),
+            Box::new(TestEthGetTransactionReceipt),
+            Box::new(TestDebugTraceCall),
+        ]
+    }
+}
+
+struct TestEthCall;
+
+impl TestSpec for TestEthCall {
+    fn name(&self) -> &'static str {
+        "eth_call"
+    }
+
+    fn run(&self, sim: &Simulation, client: &Client) -> TestResult {
+        // 部署测试合约
+        let contract_address = sim.deploy_contract(
+            client,
+            include_bytes!("../contracts/test.bin"),
+        )?;
+
+        // 调用合约
+        let call = TransactionRequest {
+            to: Some(contract_address),
+            data: Some(encode_function_call("getValue()")),
+            ..Default::default()
+        };
+
+        let result = client.eth_call(call, BlockId::Latest)?;
+
+        // 验证返回值
+        let expected = U256::from(42).to_be_bytes::<32>();
+        if result.as_ref() == expected {
+            TestResult::Pass
+        } else {
+            TestResult::Fail(format!(
+                "Expected {:?}, got {:?}",
+                expected, result
+            ))
+        }
+    }
+}
+```
+
+### AF.5 测试结果处理
+
+```rust
+use serde::{Serialize, Deserialize};
+
+/// Hive 测试结果
+#[derive(Debug, Serialize, Deserialize)]
+pub struct HiveResults {
+    pub name: String,
+    pub description: String,
+    #[serde(rename = "NClients")]
+    pub n_clients: usize,
+    #[serde(rename = "NTests")]
+    pub n_tests: usize,
+    #[serde(rename = "NPass")]
+    pub n_pass: usize,
+    #[serde(rename = "NFail")]
+    pub n_fail: usize,
+    pub clients: HashMap<String, ClientInfo>,
+    pub test_cases: Vec<TestCaseResult>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ClientInfo {
+    pub name: String,
+    pub version: String,
+    pub image: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct TestCaseResult {
+    pub name: String,
+    pub description: String,
+    pub client: String,
+    pub pass: bool,
+    pub details: String,
+    pub duration: f64,
+    pub logs: Vec<String>,
+}
+
+/// 结果分析器
+pub struct ResultAnalyzer {
+    results: HiveResults,
+}
+
+impl ResultAnalyzer {
+    pub fn load(path: &Path) -> Result<Self, Error> {
+        let content = std::fs::read_to_string(path)?;
+        let results: HiveResults = serde_json::from_str(&content)?;
+        Ok(Self { results })
+    }
+
+    /// 按客户端统计结果
+    pub fn client_summary(&self) -> HashMap<String, ClientSummary> {
+        let mut summaries: HashMap<String, ClientSummary> = HashMap::new();
+
+        for test in &self.results.test_cases {
+            let summary = summaries.entry(test.client.clone()).or_default();
+            summary.total += 1;
+            if test.pass {
+                summary.passed += 1;
+            } else {
+                summary.failed += 1;
+                summary.failed_tests.push(test.name.clone());
+            }
+            summary.total_duration += test.duration;
+        }
+
+        summaries
+    }
+
+    /// 生成兼容性矩阵
+    pub fn compatibility_matrix(&self) -> CompatibilityMatrix {
+        let clients: Vec<String> = self.results.clients.keys().cloned().collect();
+        let tests: Vec<String> = self.results.test_cases.iter()
+            .map(|t| t.name.clone())
+            .collect::<std::collections::HashSet<_>>()
+            .into_iter()
+            .collect();
+
+        let mut matrix = vec![vec![TestStatus::Unknown; clients.len()]; tests.len()];
+
+        for test in &self.results.test_cases {
+            if let Some(test_idx) = tests.iter().position(|t| t == &test.name) {
+                if let Some(client_idx) = clients.iter().position(|c| c == &test.client) {
+                    matrix[test_idx][client_idx] = if test.pass {
+                        TestStatus::Pass
+                    } else {
+                        TestStatus::Fail
+                    };
+                }
+            }
+        }
+
+        CompatibilityMatrix { clients, tests, matrix }
+    }
+
+    /// 检测回归
+    pub fn detect_regressions(&self, baseline: &HiveResults) -> Vec<Regression> {
+        let mut regressions = Vec::new();
+
+        let baseline_map: HashMap<(String, String), bool> = baseline.test_cases.iter()
+            .map(|t| ((t.name.clone(), t.client.clone()), t.pass))
+            .collect();
+
+        for test in &self.results.test_cases {
+            let key = (test.name.clone(), test.client.clone());
+            if let Some(&baseline_pass) = baseline_map.get(&key) {
+                if baseline_pass && !test.pass {
+                    regressions.push(Regression {
+                        test: test.name.clone(),
+                        client: test.client.clone(),
+                        details: test.details.clone(),
+                    });
+                }
+            }
+        }
+
+        regressions
+    }
+}
+
+#[derive(Debug, Default)]
+pub struct ClientSummary {
+    pub total: usize,
+    pub passed: usize,
+    pub failed: usize,
+    pub failed_tests: Vec<String>,
+    pub total_duration: f64,
+}
+
+#[derive(Debug)]
+pub struct CompatibilityMatrix {
+    pub clients: Vec<String>,
+    pub tests: Vec<String>,
+    pub matrix: Vec<Vec<TestStatus>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum TestStatus {
+    Pass,
+    Fail,
+    Unknown,
+}
+
+#[derive(Debug)]
+pub struct Regression {
+    pub test: String,
+    pub client: String,
+    pub details: String,
+}
+
+impl CompatibilityMatrix {
+    /// 渲染为 Markdown 表格
+    pub fn to_markdown(&self) -> String {
+        let mut md = String::new();
+
+        // 表头
+        md.push_str("| Test |");
+        for client in &self.clients {
+            md.push_str(&format!(" {} |", client));
+        }
+        md.push('\n');
+
+        // 分隔符
+        md.push_str("|------|");
+        for _ in &self.clients {
+            md.push_str("---|");
+        }
+        md.push('\n');
+
+        // 数据行
+        for (i, test) in self.tests.iter().enumerate() {
+            md.push_str(&format!("| {} |", test));
+            for (j, _) in self.clients.iter().enumerate() {
+                let status = match self.matrix[i][j] {
+                    TestStatus::Pass => "✅",
+                    TestStatus::Fail => "❌",
+                    TestStatus::Unknown => "❓",
+                };
+                md.push_str(&format!(" {} |", status));
+            }
+            md.push('\n');
+        }
+
+        md
+    }
+}
+```
+
+---
+
 ## 参考资料
 
 - [revm GitHub](https://github.com/bluealloy/revm)
@@ -8494,6 +11019,11 @@ impl<DB: Database> FlatState<DB> {
 - [op-revm GitHub](https://github.com/op-rs/op-revm)
 - [PEVM GitHub](https://github.com/risechain/pevm)
 - [Grevm GitHub](https://github.com/paradigmxyz/grevm)
+- [Reth GitHub](https://github.com/paradigmxyz/reth)
+- [Trin Portal Network](https://github.com/ethereum/trin)
+- [ethereum-hive](https://github.com/ethereum/hive)
+- [ssz_rs](https://github.com/ralexstokes/ssz-rs)
+- [Flashbots MEV-Boost](https://github.com/flashbots/mev-boost)
 - [Reth GitHub](https://github.com/paradigmxyz/reth)
 - [Benchmark Issue #7](https://github.com/bluealloy/revm/issues/7)
 - [REVM Is All You Need](https://medium.com/@solidquant/revm-is-all-you-need-e01b5b0421e4)
