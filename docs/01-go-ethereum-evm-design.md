@@ -832,12 +832,12 @@ const (
 
 // operation 定义了单个操作码的执行信息
 type operation struct {
-execute     executionFunc // 执行函数
-constantGas uint64        // 固定 Gas 消耗
-dynamicGas  gasFunc       // 动态 Gas 计算函数
-minStack    int            // 最小栈深度
-maxStack    int            // 最大栈深度
-memorySize  memorySizeFunc // 内存大小计算
+    execute     executionFunc // 执行函数
+    constantGas uint64        // 固定 Gas 消耗
+    dynamicGas  gasFunc       // 动态 Gas 计算函数
+    minStack    int            // 最小栈深度
+    maxStack    int            // 最大栈深度
+    memorySize  memorySizeFunc // 内存大小计算
 }
 
 // JumpTable 是 256 个 operation 的数组
@@ -845,12 +845,12 @@ type JumpTable [256]*operation
 
 // 不同硬分叉版本的跳转表
 func newCancunInstructionSet() JumpTable {
-instructionSet := newShanghaiInstructionSet()
-enable1153(&instructionSet) // EIP-1153: 瞬态存储
-enable4844(&instructionSet) // EIP-4844: Blob 交易
-enable5656(&instructionSet) // EIP-5656: MCOPY
-enable6780(&instructionSet) // EIP-6780: 限制 SELFDESTRUCT
-return instructionSet
+    instructionSet := newShanghaiInstructionSet()
+    enable1153(&instructionSet) // EIP-1153: 瞬态存储
+    enable4844(&instructionSet) // EIP-4844: Blob 交易
+    enable5656(&instructionSet) // EIP-5656: MCOPY
+    enable6780(&instructionSet) // EIP-6780: 限制 SELFDESTRUCT
+    return instructionSet
 }
 ```
 
@@ -898,91 +898,91 @@ return instructionSet
 
 // opAdd 实现 ADD 操作码
 func opAdd(pc *uint64, interpreter *EVMInterpreter, scope *ScopeContext) ([]byte, error) {
-x, y := scope.Stack.pop(), scope.Stack.peek()
-y.Add(&x, y)
-return nil, nil
+    x, y := scope.Stack.pop(), scope.Stack.peek()
+    y.Add(&x, y)
+    return nil, nil
 }
 
 // opSub 实现 SUB 操作码
 func opSub(pc *uint64, interpreter *EVMInterpreter, scope *ScopeContext) ([]byte, error) {
-x, y := scope.Stack.pop(), scope.Stack.peek()
-y.Sub(&x, y)
-return nil, nil
+    x, y := scope.Stack.pop(), scope.Stack.peek()
+    y.Sub(&x, y)
+    return nil, nil
 }
 
 // opMload 从内存加载 32 字节
-func opMload(pc *uint64, interpreter *EVMInterpreter, scope *ScopeContext) ([]byte, error) {
-v := scope.Stack.peek()
-offset := v.Uint64()
-v.SetBytes(scope.Memory.GetPtr(offset, 32))
-return nil, nil
+    func opMload(pc *uint64, interpreter *EVMInterpreter, scope *ScopeContext) ([]byte, error) {
+    v := scope.Stack.peek()
+    offset := v.Uint64()
+    v.SetBytes(scope.Memory.GetPtr(offset, 32))
+    return nil, nil
 }
 
 // opMstore 存储 32 字节到内存
 func opMstore(pc *uint64, interpreter *EVMInterpreter, scope *ScopeContext) ([]byte, error) {
-mStart, val := scope.Stack.pop(), scope.Stack.pop()
-scope.Memory.Set32(mStart.Uint64(), &val)
-return nil, nil
+    mStart, val := scope.Stack.pop(), scope.Stack.pop()
+    scope.Memory.Set32(mStart.Uint64(), &val)
+    return nil, nil
 }
 
 // opSload 从存储加载值
 func opSload(pc *uint64, interpreter *EVMInterpreter, scope *ScopeContext) ([]byte, error) {
-loc := scope.Stack.peek()
-hash := common.Hash(loc.Bytes32())
-val := interpreter.evm.StateDB.GetState(scope.Contract.Address(), hash)
-loc.SetBytes(val.Bytes())
-return nil, nil
+    loc := scope.Stack.peek()
+    hash := common.Hash(loc.Bytes32())
+    val := interpreter.evm.StateDB.GetState(scope.Contract.Address(), hash)
+    loc.SetBytes(val.Bytes())
+    return nil, nil
 }
 
 // opSstore 存储值到存储
 func opSstore(pc *uint64, interpreter *EVMInterpreter, scope *ScopeContext) ([]byte, error) {
-if interpreter.readOnly {
-return nil, ErrWriteProtection
-}
-loc := scope.Stack.pop()
-val := scope.Stack.pop()
-interpreter.evm.StateDB.SetState(
-scope.Contract.Address(),
-loc.Bytes32(),
-val.Bytes32(),
-)
-return nil, nil
+    if interpreter.readOnly {
+        return nil, ErrWriteProtection
+    }
+    loc := scope.Stack.pop()
+    val := scope.Stack.pop()
+    interpreter.evm.StateDB.SetState(
+        scope.Contract.Address(),
+        loc.Bytes32(),
+        val.Bytes32(),
+    )
+    return nil, nil
 }
 
 // opJump 无条件跳转
 func opJump(pc *uint64, interpreter *EVMInterpreter, scope *ScopeContext) ([]byte, error) {
-pos := scope.Stack.pop()
-if !scope.Contract.validJumpdest(&pos) {
-return nil, ErrInvalidJump
-}
-*pc = pos.Uint64() - 1
-return nil, nil
+    pos := scope.Stack.pop()
+    if !scope.Contract.validJumpdest(&pos) {
+        return nil, ErrInvalidJump
+    }
+    *pc = pos.Uint64() - 1
+    return nil, nil
 }
 
 // opJumpi 条件跳转
 func opJumpi(pc *uint64, interpreter *EVMInterpreter, scope *ScopeContext) ([]byte, error) {
-pos, cond := scope.Stack.pop(), scope.Stack.pop()
-if !cond.IsZero() {
-if !scope.Contract.validJumpdest(&pos) {
-return nil, ErrInvalidJump
-}
-*pc = pos.Uint64() - 1
-}
-return nil, nil
+    pos, cond := scope.Stack.pop(), scope.Stack.pop()
+    if !cond.IsZero() {
+        if !scope.Contract.validJumpdest(&pos) {
+            return nil, ErrInvalidJump
+        }
+		*pc = pos.Uint64() - 1
+	}
+    return nil, nil
 }
 
 // opReturn 返回数据并停止执行
-func opReturn(pc *uint64, interpreter *EVMInterpreter, scope *ScopeContext) ([]byte, error) {
-offset, size := scope.Stack.pop(), scope.Stack.pop()
-ret := scope.Memory.GetPtr(offset.Uint64(), size.Uint64())
-return ret, errStopToken
+    func opReturn(pc *uint64, interpreter *EVMInterpreter, scope *ScopeContext) ([]byte, error) {
+    offset, size := scope.Stack.pop(), scope.Stack.pop()
+    ret := scope.Memory.GetPtr(offset.Uint64(), size.Uint64())
+    return ret, errStopToken
 }
 
 // opRevert 回滚状态
 func opRevert(pc *uint64, interpreter *EVMInterpreter, scope *ScopeContext) ([]byte, error) {
-offset, size := scope.Stack.pop(), scope.Stack.pop()
-ret := scope.Memory.GetPtr(offset.Uint64(), size.Uint64())
-return ret, ErrExecutionReverted
+    offset, size := scope.Stack.pop(), scope.Stack.pop()
+    ret := scope.Memory.GetPtr(offset.Uint64(), size.Uint64())
+    return ret, ErrExecutionReverted
 }
 ```
 
@@ -997,113 +997,113 @@ return ret, ErrExecutionReverted
 
 // Run 是 EVM 解释器的主执行循环
 func (in *EVMInterpreter) Run(contract *Contract, input []byte, readOnly bool) (ret []byte, err error) {
-// 增加调用深度
-in.evm.depth++
-defer func () { in.evm.depth-- }()
+    // 增加调用深度
+    in.evm.depth++
+    defer func () { in.evm.depth-- }()
+    
+    // 调用深度限制检查 (最大 1024)
+    if in.evm.depth > int(params.CallCreateDepth) {
+        return nil, ErrDepth
+    }
+    
+    // 设置只读模式 (STATICCALL)
+    if readOnly && !in.readOnly {
+    in.readOnly = true
+    defer func () { in.readOnly = false }()
+    }
+    
+    // 重置返回数据
+    in.returnData = nil
 
-// 调用深度限制检查 (最大 1024)
-if in.evm.depth > int(params.CallCreateDepth) {
-return nil, ErrDepth
-}
+    // 空合约直接返回
+    if len(contract.Code) == 0 {
+        return nil, nil
+    }
+    
+    var (
+        op          OpCode
+        mem = NewMemory()
+        stack = newstack()
+        callContext = &ScopeContext{
+            Memory:   mem,
+            Stack:    stack,
+            Contract: contract,
+        }
+        pc = uint64(0)
+        cost uint64
+        res  []byte
+    )
+    
+    contract.Input = input
 
-// 设置只读模式 (STATICCALL)
-if readOnly && !in.readOnly {
-in.readOnly = true
-defer func () { in.readOnly = false }()
-}
+    // 主执行循环
+    for {
+        // 检查终止标志
+        if in.evm.abort.Load() {
+            return nil, ErrAborted
+        }
+        
+        // 获取当前操作码
+        op = contract.GetOp(pc)
+        operation := in.table[op]
+        
+        // 验证操作有效性
+        if operation == nil {
+			return nil, &ErrInvalidOpCode{opcode: op}
+        }
+    
+        // 栈验证
+        if sLen := stack.len(); sLen < operation.minStack {
+            return nil, &ErrStackUnderflow{}
+        } else if sLen > operation.maxStack {
+            return nil, &ErrStackOverflow{}
+        }
+    
+        // 只读模式写保护检查
+        if in.readOnly && operation.writes {
+            return nil, ErrWriteProtection
+        }
+    
+        // 计算 Gas 消耗
+        cost = operation.constantGas
+        if operation.dynamicGas != nil {
+            var dynamicCost uint64
+            dynamicCost, err = operation.dynamicGas(in.evm, contract, stack, mem, cost)
+            if err != nil {
+                return nil, err
+            }
+            cost += dynamicCost
+        }
 
-// 重置返回数据
-in.returnData = nil
+        // 扣除 Gas
+        if !contract.UseGas(cost) {
+            return nil, ErrOutOfGas
+        }
+    
+        // 内存扩展
+        if operation.memorySize != nil {
+            memSize, overflow := operation.memorySize(stack)
+            if overflow {
+                return nil, ErrGasUintOverflow
+            }
+            if memSize > 0 {
+                mem.Resize(memSize)
+            }
+        }
 
-// 空合约直接返回
-if len(contract.Code) == 0 {
-return nil, nil
-}
-
-var (
-op          OpCode
-mem = NewMemory()
-stack = newstack()
-callContext = &ScopeContext{
-Memory:   mem,
-Stack:    stack,
-Contract: contract,
-}
-pc = uint64(0)
-cost uint64
-res  []byte
-)
-
-contract.Input = input
-
-// 主执行循环
-for {
-// 检查终止标志
-if in.evm.abort.Load() {
-return nil, ErrAborted
-}
-
-// 获取当前操作码
-op = contract.GetOp(pc)
-operation := in.table[op]
-
-// 验证操作有效性
-if operation == nil {
-return nil, &ErrInvalidOpCode{opcode: op}
-}
-
-// 栈验证
-if sLen := stack.len(); sLen < operation.minStack {
-return nil, &ErrStackUnderflow{}
-} else if sLen > operation.maxStack {
-return nil, &ErrStackOverflow{}
-}
-
-// 只读模式写保护检查
-if in.readOnly && operation.writes {
-return nil, ErrWriteProtection
-}
-
-// 计算 Gas 消耗
-cost = operation.constantGas
-if operation.dynamicGas != nil {
-var dynamicCost uint64
-dynamicCost, err = operation.dynamicGas(in.evm, contract, stack, mem, cost)
-if err != nil {
-return nil, err
-}
-cost += dynamicCost
-}
-
-// 扣除 Gas
-if !contract.UseGas(cost) {
-return nil, ErrOutOfGas
-}
-
-// 内存扩展
-if operation.memorySize != nil {
-memSize, overflow := operation.memorySize(stack)
-if overflow {
-return nil, ErrGasUintOverflow
-}
-if memSize > 0 {
-mem.Resize(memSize)
-}
-}
-
-// 执行操作
-res, err = operation.execute(&pc, in, callContext)
-
-if err != nil {
-break
-}
-pc++
-}
-
-if err == errStopToken {
-err = nil
-}
-return res, err
+        // 执行操作
+        res, err = operation.execute(&pc, in, callContext)
+        
+        if err != nil {
+            break
+        }
+        pc++
+    }
+    
+    if err == errStopToken {
+        err = nil
+    }
+    return res, err
 }
 ```
 
@@ -1159,102 +1159,96 @@ return res, err
 └─────────────────────────────────────────────────────────────────┘
 ```
 
-### 5.2 EVM 调用入口
+### 5.2 EVM调用入口
 
 ```go
 // 文件: core/vm/evm.go
 
 // NewEVM 创建新的 EVM 实例
-func NewEVM(blockCtx BlockContext, txCtx TxContext, statedb StateDB,
-chainConfig *params.ChainConfig, config Config) *EVM {
-evm := &EVM{
-Context:     blockCtx,
-TxContext:   txCtx,
-StateDB:     statedb,
-chainConfig: chainConfig,
-chainRules:  chainConfig.Rules(blockCtx.BlockNumber, blockCtx.Random != nil, blockCtx.Time),
-Config:      config,
-}
-evm.interpreter = NewEVMInterpreter(evm)
-return evm
+func NewEVM(blockCtx BlockContext, txCtx TxContext, statedb StateDB, chainConfig *params.ChainConfig, config Config) *EVM {
+    evm := &EVM{
+        Context:     blockCtx,
+        TxContext:   txCtx,
+        StateDB:     statedb,
+        chainConfig: chainConfig,
+        chainRules:  chainConfig.Rules(blockCtx.BlockNumber, blockCtx.Random != nil, blockCtx.Time),
+        Config:      config,
+    }
+    evm.interpreter = NewEVMInterpreter(evm)
+    return evm
 }
 
 // Call 执行合约调用
-func (evm *EVM) Call(caller ContractRef, addr common.Address, input []byte,
-gas uint64, value *uint256.Int) (ret []byte, leftOverGas uint64, err error) {
-// 深度检查
-if evm.depth > int(params.CallCreateDepth) {
-return nil, gas, ErrDepth
-}
+func (evm *EVM) Call(caller ContractRef, addr common.Address, input []byte, gas uint64, value *uint256.Int) (ret []byte, leftOverGas uint64, err error) {
+    // 深度检查
+    if evm.depth > int(params.CallCreateDepth) {
+        return nil, gas, ErrDepth
+    }
+    
+    // 余额检查
+    if !value.IsZero() {
+        if !evm.Context.CanTransfer(evm.StateDB, caller.Address(), value.ToBig()) {
+            return nil, gas, ErrInsufficientBalance
+        }
+    }
 
-// 余额检查
-if !value.IsZero() {
-if !evm.Context.CanTransfer(evm.StateDB, caller.Address(), value.ToBig()) {
-return nil, gas, ErrInsufficientBalance
-}
-}
+    snapshot := evm.StateDB.Snapshot()
+    
+    // 检查预编译合约
+    if p, isPrecompile := evm.precompile(addr); isPrecompile {
+        ret, gas, err = RunPrecompiledContract(p, input, gas)
+    } else {
+        // 执行转账
+        evm.Context.Transfer(evm.StateDB, caller.Address(), addr, value.ToBig())
+        
+        // 获取合约代码并执行
+        code := evm.StateDB.GetCode(addr)
+        if len(code) == 0 {
+            ret, err = nil, nil
+        } else {
+            contract := NewContract(caller, AccountRef(addr), value, gas)
+            contract.SetCallCode(&addr, evm.StateDB.GetCodeHash(addr), code)
+            ret, err = evm.interpreter.Run(contract, input, false)
+            gas = contract.Gas
+        }
+    }
 
-snapshot := evm.StateDB.Snapshot()
-
-// 检查预编译合约
-if p, isPrecompile := evm.precompile(addr); isPrecompile {
-ret, gas, err = RunPrecompiledContract(p, input, gas)
-} else {
-// 执行转账
-evm.Context.Transfer(evm.StateDB, caller.Address(), addr, value.ToBig())
-
-// 获取合约代码并执行
-code := evm.StateDB.GetCode(addr)
-if len(code) == 0 {
-ret, err = nil, nil
-} else {
-contract := NewContract(caller, AccountRef(addr), value, gas)
-contract.SetCallCode(&addr, evm.StateDB.GetCodeHash(addr), code)
-ret, err = evm.interpreter.Run(contract, input, false)
-gas = contract.Gas
-}
-}
-
-// 错误回滚
-if err != nil {
-evm.StateDB.RevertToSnapshot(snapshot)
-if err != ErrExecutionReverted {
-gas = 0
-}
-}
-return ret, gas, err
+    // 错误回滚
+    if err != nil {
+        evm.StateDB.RevertToSnapshot(snapshot)
+        if err != ErrExecutionReverted {
+            gas = 0
+        }
+    }
+    return ret, gas, err
 }
 
 // DelegateCall 委托调用
-func (evm *EVM) DelegateCall(caller ContractRef, addr common.Address,
-input []byte, gas uint64) (ret []byte, leftOverGas uint64, err error) {
-// 在调用者上下文中执行目标代码
-// msg.sender 和 address(this) 保持不变
-// ...
+func (evm *EVM) DelegateCall(caller ContractRef, addr common.Address, input []byte, gas uint64) (ret []byte, leftOverGas uint64, err error) {
+    // 在调用者上下文中执行目标代码
+    // msg.sender 和 address(this) 保持不变
+    // ...
 }
 
 // StaticCall 静态调用 (只读)
-func (evm *EVM) StaticCall(caller ContractRef, addr common.Address,
-input []byte, gas uint64) (ret []byte, leftOverGas uint64, err error) {
-// 禁止任何状态修改操作
-// readOnly = true
-// ...
+func (evm *EVM) StaticCall(caller ContractRef, addr common.Address, input []byte, gas uint64) (ret []byte, leftOverGas uint64, err error) {
+    // 禁止任何状态修改操作
+    // readOnly = true
+    // ...
 }
 
 // Create 创建合约
-func (evm *EVM) Create(caller ContractRef, code []byte, gas uint64,
-value *uint256.Int) (ret []byte, contractAddr common.Address, leftOverGas uint64, err error) {
-// 地址计算: keccak256(rlp([sender, nonce]))[12:]
-contractAddr = crypto.CreateAddress(caller.Address(), evm.StateDB.GetNonce(caller.Address()))
-return evm.create(caller, &codeAndHash{code: code}, gas, value, contractAddr, CREATE)
+func (evm *EVM) Create(caller ContractRef, code []byte, gas uint64, value *uint256.Int) (ret []byte, contractAddr common.Address, leftOverGas uint64, err error) {
+    // 地址计算: keccak256(rlp([sender, nonce]))[12:]
+    contractAddr = crypto.CreateAddress(caller.Address(), evm.StateDB.GetNonce(caller.Address()))
+    return evm.create(caller, &codeAndHash{code: code}, gas, value, contractAddr, CREATE)
 }
 
 // Create2 确定性创建合约
-func (evm *EVM) Create2(caller ContractRef, code []byte, gas uint64,
-endowment *uint256.Int, salt *uint256.Int) (ret []byte, contractAddr common.Address, leftOverGas uint64, err error) {
-// 地址计算: keccak256(0xff ++ sender ++ salt ++ keccak256(code))[12:]
-contractAddr = crypto.CreateAddress2(caller.Address(), salt.Bytes32(), codeAndHash.Hash().Bytes())
-return evm.create(caller, codeAndHash, gas, endowment, contractAddr, CREATE2)
+func (evm *EVM) Create2(caller ContractRef, code []byte, gas uint64, endowment *uint256.Int, salt *uint256.Int) (ret []byte, contractAddr common.Address, leftOverGas uint64, err error) {
+    // 地址计算: keccak256(0xff ++ sender ++ salt ++ keccak256(code))[12:]
+    contractAddr = crypto.CreateAddress2(caller.Address(), salt.Bytes32(), codeAndHash.Hash().Bytes())
+    return evm.create(caller, codeAndHash, gas, endowment, contractAddr, CREATE2)
 }
 ```
 
@@ -1292,23 +1286,23 @@ return evm.create(caller, codeAndHash, gas, endowment, contractAddr, CREATE2)
 
 ---
 
-## 6. Gas 机制
+## 6. Gas机制
 
-### 6.1 Gas 基本概念
+### 6.1 Gas基本概念
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
 │                       Gas 机制概述                               │
 ├─────────────────────────────────────────────────────────────────┤
 │                                                                 │
-│  为什么需要 Gas?                                                 │
-│  1. 防止无限循环 (停机问题)                                      │
-│  2. 防止 DoS 攻击                                                │
+│  为什么需要Gas?                                                 │
+│  1. 防止无限循环(停机问题)                                      │
+│  2. 防止DoS攻击                                                │
 │  3. 资源计量和公平分配                                           │
 │  4. 激励矿工/验证者                                              │
 │                                                                 │
 │  Gas 费用计算:                                                   │
-│  总费用 = Gas 消耗量 × Gas 价格                                  │
+│  总费用 = Gas消耗量 × Gas价格                                  │
 │                                                                 │
 │  EIP-1559 后:                                                   │
 │  总费用 = Gas × (baseFee + priorityFee)                         │
@@ -1318,136 +1312,136 @@ return evm.create(caller, codeAndHash, gas, endowment, contractAddr, CREATE2)
 └─────────────────────────────────────────────────────────────────┘
 ```
 
-### 6.2 Gas 消耗常量
+### 6.2 Gas消耗常量
 
 ```go
 // 文件: core/vm/gas.go
 
 const (
-GasQuickStep   uint64 = 2 // 最简单的操作
-GasFastestStep uint64 = 3    // ADD, SUB 等
-GasFastStep    uint64 = 5    // 较快操作
-GasMidStep     uint64 = 8    // 中等操作
-GasSlowStep    uint64 = 10   // 较慢操作
-GasExtStep     uint64 = 20   // 外部操作
+    GasQuickStep   uint64 = 2 // 最简单的操作
+    GasFastestStep uint64 = 3    // ADD, SUB 等
+    GasFastStep    uint64 = 5    // 较快操作
+    GasMidStep     uint64 = 8    // 中等操作
+    GasSlowStep    uint64 = 10   // 较慢操作
+    GasExtStep     uint64 = 20   // 外部操作
 )
 
 // 各操作的 Gas 消耗
 const (
-GasVeryLow      uint64 = 3 // ADD, SUB, NOT, LT, GT
-GasLow          uint64 = 5 // MUL, DIV
-GasMid          uint64 = 8 // ADDMOD, MULMOD
-GasHigh         uint64 = 10  // JUMPI
-GasWarmAccess   uint64 = 100 // warm 访问
-GasColdAccess   uint64 = 2600  // cold 访问
-GasSset         uint64 = 20000 // SSTORE: 0 → 非0
-GasSreset       uint64 = 2900  // SSTORE: 非0 → 非0
-GasCreate       uint64 = 32000 // CREATE
-GasCallValue    uint64 = 9000 // CALL 带转账
-GasCallStipend  uint64 = 2300 // 转账赠送的 Gas
-GasNewAccount   uint64 = 25000 // 创建新账户
-GasMemory       uint64 = 3     // 内存每字
-GasKeccak256    uint64 = 30 // KECCAK256 基础
+    GasVeryLow      uint64 = 3 // ADD, SUB, NOT, LT, GT
+    GasLow          uint64 = 5 // MUL, DIV
+    GasMid          uint64 = 8 // ADDMOD, MULMOD
+    GasHigh         uint64 = 10  // JUMPI
+    GasWarmAccess   uint64 = 100 // warm 访问
+    GasColdAccess   uint64 = 2600  // cold 访问
+    GasSset         uint64 = 20000 // SSTORE: 0 → 非0
+    GasSreset       uint64 = 2900  // SSTORE: 非0 → 非0
+    GasCreate       uint64 = 32000 // CREATE
+    GasCallValue    uint64 = 9000 // CALL 带转账
+    GasCallStipend  uint64 = 2300 // 转账赠送的 Gas
+    GasNewAccount   uint64 = 25000 // 创建新账户
+    GasMemory       uint64 = 3     // 内存每字
+    GasKeccak256    uint64 = 30 // KECCAK256 基础
 )
 ```
 
-**常见操作 Gas 消耗：**
+**常见操作Gas消耗：**
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
-│                    常见操作 Gas 消耗                             │
+│                    常见操作 Gas 消耗                              │
 ├─────────────────────────────────────────────────────────────────┤
 │                                                                 │
-│  算术操作 (便宜):                                                │
+│  算术操作 (便宜):                                                 │
 │  ADD, SUB, LT, GT, EQ, ISZERO, AND, OR, XOR    = 3 Gas          │
-│  MUL, DIV, MOD                                  = 5 Gas          │
-│  EXP                                   = 10 + 50/byte Gas        │
+│  MUL, DIV, MOD                                  = 5 Gas         │
+│  EXP                                   = 10 + 50/byte Gas       │
 │                                                                 │
 │  栈操作 (便宜):                                                  │
-│  POP                                            = 2 Gas          │
+│  POP                                            = 2 Gas         │
 │  PUSH1-PUSH32, DUP1-DUP16, SWAP1-SWAP16        = 3 Gas          │
 │                                                                 │
-│  内存操作 (中等):                                                │
+│  内存操作 (中等):                                                 │
 │  MLOAD, MSTORE                          = 3 + 扩展成本           │
-│  内存扩展成本 = 3 * words + words² / 512                         │
+│  内存扩展成本 = 3 * words + words² / 512                          │
 │                                                                 │
-│  存储操作 (很贵!):                                               │
-│  SLOAD (cold)                                = 2100 Gas          │
-│  SLOAD (warm)                                = 100 Gas           │
+│  存储操作 (很贵!):                                                │
+│  SLOAD (cold)                                = 2100 Gas         │
+│  SLOAD (warm)                                = 100 Gas          │
 │  SSTORE: 0 → 非0                             = 20000 Gas         │
 │  SSTORE: 非0 → 非0                           = 2900 Gas          │
 │  SSTORE: 非0 → 0                   = 2900 Gas (返还 4800)        │
 │                                                                 │
-│  调用操作 (贵):                                                  │
-│  CALL (warm)                                 = 100 Gas           │
-│  CALL (cold)                                 = 2600 Gas          │
+│  调用操作 (贵):                                                   │
+│  CALL (warm)                                 = 100 Gas          │
+│  CALL (cold)                                 = 2600 Gas         │
 │  CALL + 转账                                 + 9000 Gas          │
-│  CALL + 创建新账户                           + 25000 Gas         │
+│  CALL + 创建新账户                           + 25000 Gas          │
 │                                                                 │
-│  创建操作 (最贵):                                                │
-│  CREATE/CREATE2                              = 32000 Gas         │
-│  + 代码存储成本                              = 200/byte          │
+│  创建操作 (最贵):                                                 │
+│  CREATE/CREATE2                              = 32000 Gas        │
+│  + 代码存储成本                              = 200/byte           │
 │                                                                 │
 └─────────────────────────────────────────────────────────────────┘
 ```
 
-### 6.3 动态 Gas 计算
+### 6.3 动态Gas计算
 
 ```go
 // 内存扩展的 Gas 成本
 func memoryGasCost(mem *Memory, newMemSize uint64) (uint64, error) {
-if newMemSize == 0 {
-return 0, nil
-}
-
-newMemSizeWords := toWordSize(newMemSize)
-newMemSize = newMemSizeWords * 32
-
-if newMemSize > uint64(len(mem.store)) {
-// cost = 3 * words + words² / 512
-square := newMemSizeWords * newMemSizeWords
-linCoef := newMemSizeWords * params.MemoryGas
-quadCoef := square / params.QuadCoeffDiv
-newTotalFee := linCoef + quadCoef
-
-fee := newTotalFee - mem.lastGasCost
-mem.lastGasCost = newTotalFee
-return fee, nil
-}
-return 0, nil
+    if newMemSize == 0 {
+        return 0, nil
+    }
+    
+    newMemSizeWords := toWordSize(newMemSize)
+    newMemSize = newMemSizeWords * 32
+    
+    if newMemSize > uint64(len(mem.store)) {
+        // cost = 3 * words + words² / 512
+        square := newMemSizeWords * newMemSizeWords
+        linCoef := newMemSizeWords * params.MemoryGas
+        quadCoef := square / params.QuadCoeffDiv
+        newTotalFee := linCoef + quadCoef
+        
+        fee := newTotalFee - mem.lastGasCost
+        mem.lastGasCost = newTotalFee
+        return fee, nil
+    }
+    return 0, nil
 }
 
 // 63/64 规则 (EIP-150)
 func callGas(isEip150 bool, availableGas, base uint64, callCost *uint256.Int) (uint64, error) {
-if isEip150 {
-// 最多传递 63/64 的可用 Gas
-availableGas = availableGas - base
-gas := availableGas - availableGas/64
-
-if !callCost.IsUint64() || gas < callCost.Uint64() {
-return gas, nil
-}
-return callCost.Uint64(), nil
-}
-return callCost.Uint64(), nil
+    if isEip150 {
+        // 最多传递 63/64 的可用 Gas
+        availableGas = availableGas - base
+        gas := availableGas - availableGas/64
+        
+        if !callCost.IsUint64() || gas < callCost.Uint64() {
+            return gas, nil
+        }
+        return callCost.Uint64(), nil
+    }
+    return callCost.Uint64(), nil
 }
 ```
 
-**EIP-2929 访问列表：**
+**EIP-2929访问列表：**
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
 │                   EIP-2929 访问列表                              │
 ├─────────────────────────────────────────────────────────────────┤
 │                                                                 │
-│  首次访问某地址/存储槽 = Cold (贵)                               │
-│  再次访问同一位置     = Warm (便宜)                              │
+│  首次访问某地址/存储槽 = Cold (贵)                                 │
+│  再次访问同一位置     = Warm (便宜)                                │
 │                                                                 │
-│  访问列表在每笔交易开始时初始化:                                  │
+│  访问列表在每笔交易开始时初始化:                                     │
 │  • tx.to 地址 (warm)                                             │
 │  • tx.from 地址 (warm)                                           │
-│  • 预编译合约地址 (warm)                                         │
-│  • 交易指定的 accessList 中的地址/槽 (warm)                      │
+│  • 预编译合约地址 (warm)                                          │
+│  • 交易指定的 accessList 中的地址/槽 (warm)                        │
 │                                                                 │
 └─────────────────────────────────────────────────────────────────┘
 ```
@@ -1463,26 +1457,26 @@ return callCost.Uint64(), nil
 │                        EVM 内存模型                              │
 ├─────────────────────────────────────────────────────────────────┤
 │                                                                 │
-│  EVM 内存是一个可动态扩展的字节数组:                              │
+│  EVM 内存是一个可动态扩展的字节数组:                                 │
 │                                                                 │
-│  偏移量:  0    32   64   96   128  160  192  224  256  ...     │
-│         ┌────┬────┬────┬────┬────┬────┬────┬────┬────┬───      │
-│  内存:  │    │    │    │    │    │    │    │    │    │         │
-│         └────┴────┴────┴────┴────┴────┴────┴────┴────┴───      │
+│  offset:0    32   64   96   128  160  192  224  256  ...        │
+│         ┌────┬────┬────┬────┬────┬────┬────┬────┬────┬───       │
+│  memory:│    │    │    │    │    │    │    │    │    │          │
+│         └────┴────┴────┴────┴────┴────┴────┴────┴────┴───       │
 │                                                                 │
 │  特点:                                                          │
 │  1. 按字节寻址                                                   │
-│  2. 读写单位: 按字(32字节)或按字节                                │
-│  3. 自动扩展: 访问超出当前大小时自动扩展                          │
-│  4. 扩展成本: 二次方增长                                         │
-│  5. 零初始化: 新扩展的内存全为 0                                  │
-│  6. 易失性: 每次合约调用结束后内存被清空                          │
+│  2. 读写单位: 按字(32字节)或按字节                                  │
+│  3. 自动扩展: 访问超出当前大小时自动扩展                              │
+│  4. 扩展成本: 二次方增长                                           │
+│  5. 零初始化: 新扩展的内存全为 0                                    │
+│  6. 易失性: 每次合约调用结束后内存被清空                              │
 │                                                                 │
-│  Solidity 内存布局惯例:                                          │
-│  0x00 - 0x3f (64字节): 暂存空间 (用于哈希计算)                   │
-│  0x40 - 0x5f (32字节): 空闲内存指针                              │
+│  Solidity 内存布局惯例:                                           │
+│  0x00 - 0x3f (64字节): 暂存空间 (用于哈希计算)                      │
+│  0x40 - 0x5f (32字节): 空闲内存指针                                │
 │  0x60 - 0x7f (32字节): 零槽                                      │
-│  0x80 - ...         : 空闲内存区域                               │
+│  0x80 - ...         : 空闲内存区域                                │
 │                                                                 │
 └─────────────────────────────────────────────────────────────────┘
 ```
@@ -1498,57 +1492,57 @@ return callCost.Uint64(), nil
 │                      存储 vs 内存                                │
 ├─────────────────────────────────────────────────────────────────┤
 │                                                                 │
-│  特性      │   内存 (Memory)    │   存储 (Storage)              │
-│  ──────────┼───────────────────┼────────────────────           │
-│  生命周期  │   调用期间         │   永久                        │
-│  大小      │   动态扩展         │   2^256 个槽位                │
-│  寻址      │   字节偏移         │   256位键                     │
-│  数据大小  │   任意字节         │   256位值                     │
-│  Gas成本   │   便宜             │   非常贵                      │
-│  初始值    │   0                │   0                           │
+│  特性       │   内存 (Memory)   │   存储 (Storage)                │
+│  ──────────┼───────────────────┼────────────────────            │
+│  生命周期   │   调用期间          │   永久                         │
+│  大小      │   动态扩展          │   2^256 个槽位                  │
+│  寻址      │   字节偏移          │   256位键                       │
+│  数据大小   │   任意字节          │   256位值                      │
+│  Gas成本   │   便宜             │   非常贵                        │
+│  初始值     │   0               │   0                            │
 │                                                                 │
 └─────────────────────────────────────────────────────────────────┘
 ```
 
-### 8.2 Solidity 存储布局
+### 8.2 Solidity存储布局
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
-│                  Solidity 存储布局规则                           │
+│                  Solidity 存储布局规则                            │
 ├─────────────────────────────────────────────────────────────────┤
 │                                                                 │
 │  contract Example {                                             │
 │      uint256 a;           // slot 0                             │
 │      uint256 b;           // slot 1                             │
 │      uint128 c;           // slot 2 (低128位)                   │
-│      uint128 d;           // slot 2 (高128位) - 打包!           │
+│      uint128 d;           // slot 2 (高128位) - 打包!            │
 │      mapping(address => uint) balances;  // slot 3              │
 │      uint256[] arr;       // slot 4                             │
 │  }                                                              │
 │                                                                 │
-│  Mapping 存储位置: keccak256(key . slot)                        │
-│  动态数组: slot 存储长度, 元素在 keccak256(slot) + index        │
+│  Mapping 存储位置: keccak256(key . slot)                         │
+│  动态数组: slot 存储长度, 元素在 keccak256(slot) + index            │
 │                                                                 │
 └─────────────────────────────────────────────────────────────────┘
 ```
 
-### 8.3 SSTORE Gas 成本矩阵
+### 8.3 SSTORE Gas成本矩阵
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
 │                   SSTORE Gas 成本矩阵                            │
 ├─────────────────────────────────────────────────────────────────┤
 │                                                                 │
-│  场景                           │ Gas 成本    │ 返还             │
+│  场景                            │ Gas 成本    │ 返还             │
 │  ───────────────────────────────┼────────────┼───────────       │
-│  current == new (无变化)        │    100     │     -            │
+│  current == new (无变化)         │    100     │     -            │
 │                                 │            │                  │
-│  original == current (首次修改):│            │                  │
-│    original == 0 (创建)         │   20000    │     -            │
-│    original != 0, new == 0 (删除)│   2900    │  +4800           │
+│  original == current (首次修改): │            │                  │
+│    original == 0 (创建)          │   20000    │     -            │
+│    original != 0, new == 0 (删除)│   2900    │  +4800            │
 │    original != 0, new != 0 (改)  │   2900    │     -            │
 │                                 │            │                  │
-│  original != current (已修改):  │    100     │   可能有          │
+│  original != current (已修改):   │    100     │   可能有          │
 │                                                                 │
 │  + EIP-2929 Cold 访问: +2100 Gas                                │
 │                                                                 │
@@ -1562,17 +1556,17 @@ return callCost.Uint64(), nil
 │                   瞬态存储 (EIP-1153)                            │
 ├─────────────────────────────────────────────────────────────────┤
 │                                                                 │
-│  特性        │  持久存储 (SSTORE)  │ 瞬态存储 (TSTORE)           │
-│  ────────────┼───────────────────┼───────────────────          │
-│  生命周期    │  永久              │  交易期间                    │
-│  Gas 成本    │  非常高 (20000)    │  便宜 (100)                  │
-│  状态变化    │  会影响状态根      │  不影响状态根                 │
-│  跨交易      │  保持              │  交易结束后清空               │
+│  特性         │  持久存储 (SSTORE) │ 瞬态存储 (TSTORE)             │
+│  ────────────┼───────────────────┼───────────────────           │
+│  生命周期     │  永久              │  交易期间                     │
+│  Gas 成本    │  非常高 (20000)    │  便宜 (100)                   │
+│  状态变化     │  会影响状态根       │  不影响状态根                  │
+│  跨交易      │  保持              │  交易结束后清空                 │
 │                                                                 │
 │  使用场景:                                                       │
-│  1. 重入锁 (比 SSTORE 便宜99%)                                   │
-│  2. 跨合约通信 (同一交易内)                                       │
-│  3. 闪电贷回调验证                                               │
+│  1. 重入锁 (比 SSTORE 便宜99%)                                    │
+│  2. 跨合约通信 (同一交易内)                                        │
+│  3. 闪电贷回调验证                                                │
 │                                                                 │
 └─────────────────────────────────────────────────────────────────┘
 ```
@@ -1585,29 +1579,29 @@ return callCost.Uint64(), nil
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
-│                    CALL 完整执行流程                             │
+│                    CALL 完整执行流程                              │
 ├─────────────────────────────────────────────────────────────────┤
 │                                                                 │
 │  1. 交易处理器 (StateProcessor)                                  │
 │     ├── 验证签名                                                 │
-│     ├── 检查 nonce                                               │
-│     ├── 扣除固有 Gas                                             │
-│     └── 调用 EVM                                                 │
-│                              ↓                                   │
+│     ├── 检查nonce                                                │
+│     ├── 扣除固有Gas                                              │
+│     └── 调用EVM                                                 │
+│                              ↓                                  │
 │  2. EVM.Call()                                                  │
-│     ├── 创建状态快照                                             │
+│     ├── 创建状态快照                                              │
 │     ├── 转账                                                     │
-│     ├── 加载合约代码                                             │
-│     └── 创建 Contract 对象                                       │
-│                              ↓                                   │
+│     ├── 加载合约代码                                              │
+│     └── 创建Contract对象                                         │
+│                              ↓                                  │
 │  3. Interpreter.Run()                                           │
-│     ├── 主循环执行字节码                                         │
-│     ├── 遇到 CALL 指令时递归调用                                 │
-│     └── RETURN/REVERT 结束执行                                   │
-│                              ↓                                   │
+│     ├── 主循环执行字节码                                          │
+│     ├── 遇到CALL指令时递归调用                                     │
+│     └── RETURN/REVERT结束执行                                    │
+│                              ↓                                  │
 │  4. 返回结果                                                     │
-│     ├── 成功: 更新状态                                           │
-│     └── 失败: 回滚到快照                                         │
+│     ├── 成功: 更新状态                                            │
+│     └── 失败: 回滚到快照                                          │
 │                                                                 │
 └─────────────────────────────────────────────────────────────────┘
 ```
@@ -1621,12 +1615,12 @@ return callCost.Uint64(), nil
 │                                                                 │
 │  CREATE:                                                        │
 │  address = keccak256(rlp([sender, nonce]))[12:]                 │
-│  • 依赖 nonce，地址不可预测                                      │
+│  • 依赖 nonce，地址不可预测                                        │
 │                                                                 │
 │  CREATE2:                                                       │
 │  address = keccak256(0xff ++ sender ++ salt ++ codehash)[12:]   │
-│  • 地址完全确定性，可提前计算                                    │
-│  • 适用于工厂模式、反事实部署                                    │
+│  • 地址完全确定性，可提前计算                                       │
+│  • 适用于工厂模式、反事实部署                                       │
 │                                                                 │
 └─────────────────────────────────────────────────────────────────┘
 ```
@@ -1655,20 +1649,20 @@ return callCost.Uint64(), nil
 ```go
 // PrecompiledContract 是预编译合约的接口
 type PrecompiledContract interface {
-RequiredGas(input []byte) uint64
-Run(input []byte) ([]byte, error)
+    RequiredGas(input []byte) uint64
+    Run(input []byte) ([]byte, error)
 }
 
 // ecrecover 实现示例
 type ecrecover struct{}
 
 func (c *ecrecover) RequiredGas(input []byte) uint64 {
-return params.EcrecoverGas // 3000 Gas
+    return params.EcrecoverGas // 3000 Gas
 }
 
 func (c *ecrecover) Run(input []byte) ([]byte, error) {
-// 解析输入: msgHash || v || r || s
-// 恢复公钥并返回地址
+    // 解析输入: msgHash || v || r || s
+    // 恢复公钥并返回地址
 }
 ```
 
@@ -1676,7 +1670,7 @@ func (c *ecrecover) Run(input []byte) ([]byte, error) {
 
 ## 11. 实战代码示例
 
-### 11.1 模拟 EVM 执行
+### 11.1 模拟EVM执行
 
 ```go
 package main
@@ -1827,6 +1821,6 @@ func main() {
 2. 阅读操作码定义 (opcodes.go)
 3. 理解执行循环 (interpreter.go)
 4. 学习指令实现 (instructions.go)
-5. 掌握 Gas 机制 (gas_table.go)
+5. 掌握Gas机制 (gas_table.go)
 6. 理解调用机制 (evm.go)
 7. 实践代码调试和追踪
