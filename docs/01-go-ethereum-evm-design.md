@@ -359,7 +359,7 @@ type EVM struct {
 ```go
 // 文件: core/vm/interpreter.go
 
-// Config是解释器的配置
+// Config 是解释器的配置
 type Config struct {
     Tracer                  EVMLogger // 追踪器，用于调试
     NoBaseFee               bool      // 禁用基础费用检查
@@ -367,14 +367,14 @@ type Config struct {
     ExtraEips               []int     // 额外启用的EIP
 }
 
-// ScopeContext包含每次合约调用的作用域数据
+// ScopeContext 包含每次合约调用的作用域数据
 type ScopeContext struct {
     Memory   *Memory   // 内存
     Stack    *Stack    // 栈
     Contract *Contract // 当前执行的合约
 }
 
-// EVMInterpreter代表EVM解释器
+// EVMInterpreter 代表EVM解释器
 type EVMInterpreter struct {
     evm   *EVM       // 关联的EVM实例
     table *JumpTable // 操作码跳转表
@@ -383,11 +383,11 @@ type EVMInterpreter struct {
     hasher    crypto.KeccakState
     hasherBuf common.Hash
     
-    // readOnly只读模式标志
-    // 在STATICCALL中会设为true
+    // readOnly 只读模式标志
+    // 在STATICCALL 中会设为true
     readOnly bool
     
-    // returnData上一次CALL的返回数据
+    // returnData 上一次CALL的返回数据
     returnData []byte
 }
 ```
@@ -397,40 +397,40 @@ type EVMInterpreter struct {
 ```go
 // 文件: core/vm/contract.go
 
-// Contract表示状态数据库中的以太坊合约
+// Contract 表示状态数据库中的以太坊合约
 type Contract struct {
     // CallerAddress是调用者的地址（初始化此合约的账户）
     CallerAddress common.Address
     
-    // caller是调用者的合约引用
+    // caller 是调用者的合约引用
     caller ContractRef
     
-    // self是本合约的引用
+    // self 是本合约的引用
     self ContractRef
     
-    // jumpdests是JUMPDEST分析结果的缓存
+    // jumpdests 是JUMPDEST分析结果的缓存
     // 用于验证跳转目标是否有效
     jumpdests map[common.Hash]bitvec
     
-    // analysis是当前代码的分析结果
+    // analysis 是当前代码的分析结果
     analysis bitvec
     
-    // Code是合约字节码
+    // Code 是合约字节码
     Code []byte
     
-    // CodeHash是代码的keccak256哈希
+    // CodeHash 是代码的keccak256哈希
     CodeHash common.Hash
     
-    // CodeAddr是代码所在的地址（可能与执行地址不同，如 DELEGATECALL）
+    // CodeAddr 是代码所在的地址（可能与执行地址不同，如 DELEGATECALL）
     CodeAddr *common.Address
     
-    // Input是调用时传入的数据
+    // Input 是调用时传入的数据
     Input []byte
     
-    // Gas是可用的Gas
+    // Gas 是可用的Gas
     Gas uint64
     
-    // value是调用时转账的ETH数量（wei）
+    // value 是调用时转账的ETH数量（wei）
     value *uint256.Int
 }
 ```
@@ -487,7 +487,7 @@ type Stack struct {
     data []uint256.Int
 }
 
-// 创建新栈，预分配 16 个元素
+// 创建新栈，预分配16个元素
 func newstack() *Stack {
     return &Stack{data: make([]uint256.Int, 0, 16)}
 }
@@ -509,7 +509,7 @@ func (st *Stack) peek() *uint256.Int {
     return &st.data[len(st.data)-1]
 }
 
-// Back 返回从栈顶往下第 n 个元素
+// Back 返回从栈顶往下第n个元素
 func (st *Stack) Back(n int) *uint256.Int {
     return &st.data[len(st.data)-n-1]
 }
@@ -595,7 +595,7 @@ func NewMemory() *Memory {
     return &Memory{}
 }
 
-// Set 设置 offset 开始的size字节为value
+// Set 设置offset开始的size字节为value
 func (m *Memory) Set(offset, size uint64, value []byte) {
     if size > 0 {
     if offset+size > uint64(len(m.store)) {
@@ -605,7 +605,7 @@ func (m *Memory) Set(offset, size uint64, value []byte) {
     }
 }
 
-// Set32 在 offset 位置设置一个32字节的值
+// Set32 在offset位置设置一个32字节的值
 func (m *Memory) Set32(offset uint64, val *uint256.Int) {
     if offset+32 > uint64(len(m.store)) {
         m.store = append(m.store, make([]byte, offset+32-uint64(len(m.store)))...)
@@ -620,7 +620,7 @@ func (m *Memory) Resize(size uint64) {
     }
 }
 
-// GetCopy 返回 offset 开始size字节的副本
+// GetCopy 返回offset开始size字节的副本
 func (m *Memory) GetCopy(offset, size uint64) []byte {
     if size == 0 {
         return nil
@@ -896,21 +896,21 @@ func newCancunInstructionSet() JumpTable {
 ```go
 // 文件: core/vm/instructions.go
 
-// opAdd 实现 ADD 操作码
+// opAdd 实现ADD操作码
 func opAdd(pc *uint64, interpreter *EVMInterpreter, scope *ScopeContext) ([]byte, error) {
     x, y := scope.Stack.pop(), scope.Stack.peek()
     y.Add(&x, y)
     return nil, nil
 }
 
-// opSub 实现 SUB 操作码
+// opSub 实现SUB操作码
 func opSub(pc *uint64, interpreter *EVMInterpreter, scope *ScopeContext) ([]byte, error) {
     x, y := scope.Stack.pop(), scope.Stack.peek()
     y.Sub(&x, y)
     return nil, nil
 }
 
-// opMload 从内存加载 32 字节
+// opMload 从内存加载32字节
     func opMload(pc *uint64, interpreter *EVMInterpreter, scope *ScopeContext) ([]byte, error) {
     v := scope.Stack.peek()
     offset := v.Uint64()
@@ -918,7 +918,7 @@ func opSub(pc *uint64, interpreter *EVMInterpreter, scope *ScopeContext) ([]byte
     return nil, nil
 }
 
-// opMstore 存储 32 字节到内存
+// opMstore 存储32字节到内存
 func opMstore(pc *uint64, interpreter *EVMInterpreter, scope *ScopeContext) ([]byte, error) {
     mStart, val := scope.Stack.pop(), scope.Stack.pop()
     scope.Memory.Set32(mStart.Uint64(), &val)
@@ -995,7 +995,7 @@ func opRevert(pc *uint64, interpreter *EVMInterpreter, scope *ScopeContext) ([]b
 ```go
 // 文件: core/vm/interpreter.go
 
-// Run 是 EVM 解释器的主执行循环
+// Run 是EVM解释器的主执行循环
 func (in *EVMInterpreter) Run(contract *Contract, input []byte, readOnly bool) (ret []byte, err error) {
     // 增加调用深度
     in.evm.depth++

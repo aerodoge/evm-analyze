@@ -27,15 +27,15 @@
 │  │                                                          │  │
 │  │  ┌───────────────────┐ ┌──────────────────────────────┐ │  │
 │  │  │   Creation Code   │ │   Constructor Arguments      │ │  │
-│  │  │   (初始化代码)    │ │   (构造函数参数, ABI编码)   │ │  │
+│  │  │   (初始化代码)      │ │   (构造函数参数, ABI编码)      │ │  │
 │  │  └─────────┬─────────┘ └──────────────────────────────┘ │  │
 │  │            │                                             │  │
 │  │            ▼                                             │  │
 │  │  ┌─────────────────────────────────────────────────────┐ │  │
-│  │  │  Creation Code 包含:                                │ │  │
-│  │  │  1. 初始化逻辑 (执行构造函数)                        │ │  │
-│  │  │  2. Runtime Code (要部署的代码)                     │ │  │
-│  │  │  3. CODECOPY + RETURN 将 runtime code 返回          │ │  │
+│  │  │  Creation Code 包含:                                 │ │  │
+│  │  │  1. 初始化逻辑 (执行构造函数)                           │ │  │
+│  │  │  2. Runtime Code (要部署的代码)                       │ │  │
+│  │  │  3. CODECOPY + RETURN 将 runtime code 返回           │ │  │
 │  │  └─────────────────────────────────────────────────────┘ │  │
 │  │                                                          │  │
 │  └──────────────────────────────────────────────────────────┘  │
@@ -191,75 +191,75 @@ contract Simple {
 
 // Create 部署合约
 func (evm *EVM) Create(caller ContractRef, code []byte, gas uint64, value *uint256.Int) (ret []byte, contractAddr common.Address, leftOverGas uint64, err error) {
-// 1. 计算合约地址
-contractAddr = crypto.CreateAddress(caller.Address(), evm.StateDB.GetNonce(caller.Address()))
+    // 1. 计算合约地址
+    contractAddr = crypto.CreateAddress(caller.Address(), evm.StateDB.GetNonce(caller.Address()))
 
-return evm.create(caller, &codeAndHash{code: code}, gas, value, contractAddr, CREATE)
+    return evm.create(caller, &codeAndHash{code: code}, gas, value, contractAddr, CREATE)
 }
 
 func (evm *EVM) create(caller ContractRef, codeAndHash *codeAndHash, gas uint64, value *uint256.Int, address common.Address, typ OpCode) ([]byte, common.Address, uint64, error) {
-// 2. 深度检查
-if evm.depth > int(params.CallCreateDepth) {
-return nil, common.Address{}, gas, ErrDepth
-}
+    // 2. 深度检查
+    if evm.depth > int(params.CallCreateDepth) {
+        return nil, common.Address{}, gas, ErrDepth
+    }
 
-// 3. 余额检查
-if !value.IsZero() && !evm.Context.CanTransfer(evm.StateDB, caller.Address(), value.ToBig()) {
-return nil, common.Address{}, gas, ErrInsufficientBalance
-}
+    // 3. 余额检查
+    if !value.IsZero() && !evm.Context.CanTransfer(evm.StateDB, caller.Address(), value.ToBig()) {
+		return nil, common.Address{}, gas, ErrInsufficientBalance
+    }
 
-// 4. 增加 nonce
-nonce := evm.StateDB.GetNonce(caller.Address())
-evm.StateDB.SetNonce(caller.Address(), nonce+1)
+    // 4. 增加 nonce
+    nonce := evm.StateDB.GetNonce(caller.Address())
+    evm.StateDB.SetNonce(caller.Address(), nonce+1)
 
-// 5. 检查地址冲突
-contractHash := evm.StateDB.GetCodeHash(address)
-if evm.StateDB.GetNonce(address) != 0 || (contractHash != (common.Hash{}) && contractHash != types.EmptyCodeHash) {
-return nil, common.Address{}, 0, ErrContractAddressCollision
-}
+    // 5. 检查地址冲突
+    contractHash := evm.StateDB.GetCodeHash(address)
+    if evm.StateDB.GetNonce(address) != 0 || (contractHash != (common.Hash{}) && contractHash != types.EmptyCodeHash) {
+        return nil, common.Address{}, 0, ErrContractAddressCollision
+    }
 
-// 6. 创建快照
-snapshot := evm.StateDB.Snapshot()
+    // 6. 创建快照
+    snapshot := evm.StateDB.Snapshot()
+    
+    // 7. 创建账户并设置 nonce = 1
+    evm.StateDB.CreateAccount(address)
+    evm.StateDB.SetNonce(address, 1)
+    
+    // 8. 转账
+    evm.Context.Transfer(evm.StateDB, caller.Address(), address, value.ToBig())
+    
+    // 9. 创建合约对象并执行初始化代码
+    contract := NewContract(caller, AccountRef(address), value, gas)
+    contract.SetCodeOptionalHash(&address, codeAndHash)
+    
+    ret, err := evm.interpreter.Run(contract, nil, false)
 
-// 7. 创建账户并设置 nonce = 1
-evm.StateDB.CreateAccount(address)
-evm.StateDB.SetNonce(address, 1)
+    // 10. 检查代码大小限制 (24KB)
+    if err == nil && len(ret) > params.MaxCodeSize {
+        err = ErrMaxCodeSizeExceeded
+    }
+    
+    // 11. 检查 EIP-3541: 禁止 0xEF 开头
+    if err == nil && len(ret) > 0 && ret[0] == 0xEF {
+        err = ErrInvalidCode
+    }
 
-// 8. 转账
-evm.Context.Transfer(evm.StateDB, caller.Address(), address, value.ToBig())
+    // 12. 支付代码存储 Gas (200 per byte)
+    if err == nil {
+        createDataGas := uint64(len(ret)) * params.CreateDataGas
+        if contract.UseGas(createDataGas) {
+            evm.StateDB.SetCode(address, ret)  // 存储 runtime code
+        } else {
+            err = ErrCodeStoreOutOfGas
+        }
+    }
+    
+    // 13. 错误回滚
+    if err != nil {
+        evm.StateDB.RevertToSnapshot(snapshot)
+    }
 
-// 9. 创建合约对象并执行初始化代码
-contract := NewContract(caller, AccountRef(address), value, gas)
-contract.SetCodeOptionalHash(&address, codeAndHash)
-
-ret, err := evm.interpreter.Run(contract, nil, false)
-
-// 10. 检查代码大小限制 (24KB)
-if err == nil && len(ret) > params.MaxCodeSize {
-err = ErrMaxCodeSizeExceeded
-}
-
-// 11. 检查 EIP-3541: 禁止 0xEF 开头
-if err == nil && len(ret) > 0 && ret[0] == 0xEF {
-err = ErrInvalidCode
-}
-
-// 12. 支付代码存储 Gas (200 per byte)
-if err == nil {
-createDataGas := uint64(len(ret)) * params.CreateDataGas
-if contract.UseGas(createDataGas) {
-evm.StateDB.SetCode(address, ret)  // 存储 runtime code
-} else {
-err = ErrCodeStoreOutOfGas
-}
-}
-
-// 13. 错误回滚
-if err != nil {
-evm.StateDB.RevertToSnapshot(snapshot)
-}
-
-return ret, address, contract.Gas, err
+    return ret, address, contract.Gas, err
 }
 ```
 
@@ -271,14 +271,14 @@ return ret, address, contract.Gas, err
 // CreateAddress 计算 CREATE 地址
 // address = keccak256(rlp([sender, nonce]))[12:]
 func CreateAddress(b common.Address, nonce uint64) common.Address {
-data, _ := rlp.EncodeToBytes([]interface{}{b, nonce})
-return common.BytesToAddress(Keccak256(data)[12:])
+    data, _ := rlp.EncodeToBytes([]interface{}{b, nonce})
+    return common.BytesToAddress(Keccak256(data)[12:])
 }
 
 // CreateAddress2 计算 CREATE2 地址
 // address = keccak256(0xff ++ sender ++ salt ++ keccak256(initCode))[12:]
 func CreateAddress2(b common.Address, salt [32]byte, inithash []byte) common.Address {
-return common.BytesToAddress(Keccak256([]byte{0xff}, b.Bytes(), salt[:], inithash)[12:])
+    return common.BytesToAddress(Keccak256([]byte{0xff}, b.Bytes(), salt[:], inithash)[12:])
 }
 ```
 
@@ -286,53 +286,53 @@ return common.BytesToAddress(Keccak256([]byte{0xff}, b.Bytes(), salt[:], inithas
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
-│                    合约地址计算示例                              │
+│                    合约地址计算示例                                │
 ├─────────────────────────────────────────────────────────────────┤
 │                                                                 │
 │  CREATE 地址计算:                                                │
 │  ┌──────────────────────────────────────────────────────────┐  │
-│  │  sender = 0x6ac7ea33f8831ea9dcc53393aaa88b25a785dbf0      │  │
+│  │  sender = 0x6ac7ea33f8831ea9dcc53393aaa88b25a785dbf0     │  │
 │  │  nonce = 0                                               │  │
 │  │                                                          │  │
 │  │  rlp([sender, nonce])                                    │  │
-│  │  = rlp([0x6ac7ea33..., 0])                              │  │
-│  │  = 0xd694 6ac7ea33f8831ea9dcc53393aaa88b25a785dbf0 80   │  │
+│  │  = rlp([0x6ac7ea33..., 0])                               │  │
+│  │  = 0xd694 6ac7ea33f8831ea9dcc53393aaa88b25a785dbf0 80    │  │
 │  │         ↑              ↑                            ↑    │  │
-│  │       前缀          20字节地址                   nonce=0 │  │
+│  │       前缀          20字节地址                   nonce=0   │  │
 │  │                                                          │  │
-│  │  keccak256(rlp_data)                                    │  │
+│  │  keccak256(rlp_data)                                     │  │
 │  │  = 0xcd234a471b72ba2f1ccf0a70fcaba648a5eecd8defac28fe... │  │
 │  │                                                          │  │
-│  │  取后 20 字节                                            │  │
+│  │  取后 20 字节                                             │  │
 │  │  address = 0xcd234a471b72ba2f1ccf0a70fcaba648a5eecd8d    │  │
 │  │                                                          │  │
 │  └──────────────────────────────────────────────────────────┘  │
 │                                                                 │
 │  CREATE2 地址计算:                                               │
 │  ┌──────────────────────────────────────────────────────────┐  │
-│  │  sender = 0x6ac7ea33f8831ea9dcc53393aaa88b25a785dbf0      │  │
+│  │  sender = 0x6ac7ea33f8831ea9dcc53393aaa88b25a785dbf0     │  │
 │  │  salt = 0x0000...0001 (32字节)                           │  │
-│  │  initCode = 0x6080604052... (合约创建代码)               │  │
+│  │  initCode = 0x6080604052... (合约创建代码)                 │  │
 │  │                                                          │  │
-│  │  initCodeHash = keccak256(initCode)                     │  │
-│  │  = 0xabcd1234...                                        │  │
+│  │  initCodeHash = keccak256(initCode)                      │  │
+│  │  = 0xabcd1234...                                         │  │
 │  │                                                          │  │
-│  │  data = 0xff ++ sender ++ salt ++ initCodeHash          │  │
+│  │  data = 0xff ++ sender ++ salt ++ initCodeHash           │  │
 │  │  = 0xff                                    (1 byte)      │  │
 │  │    6ac7ea33f8831ea9dcc53393aaa88b25a785dbf0 (20 bytes)   │  │
 │  │    0000...0001                             (32 bytes)    │  │
 │  │    abcd1234...                             (32 bytes)    │  │
 │  │                                                          │  │
-│  │  keccak256(data)[12:]                                   │  │
-│  │  address = 0x...                                        │  │
+│  │  keccak256(data)[12:]                                    │  │
+│  │  address = 0x...                                         │  │
 │  │                                                          │  │
 │  └──────────────────────────────────────────────────────────┘  │
-│                                                                 │
-│  CREATE2 的优势:                                                 │
-│  • 地址可预测 (部署前就知道)                                     │
-│  • 相同参数 = 相同地址                                          │
-│  • 支持反事实部署                                               │
-│  • 工厂模式常用                                                 │
+│                                                                │
+│  CREATE2 的优势:                                                │
+│  • 地址可预测 (部署前就知道)                                       │
+│  • 相同参数 = 相同地址                                            │
+│  • 支持反事实部署                                                 │
+│  • 工厂模式常用                                                   │
 │                                                                 │
 └─────────────────────────────────────────────────────────────────┘
 ```
